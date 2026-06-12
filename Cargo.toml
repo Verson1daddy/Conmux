@@ -1,0 +1,37 @@
+[package]
+name = "conmux"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Windows-native terminal multiplexer: PowerShell, WSL and AI agents in one supervised session (mechanism layer)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Verson1daddy/Conmux"
+readme = "README.md"
+keywords = ["terminal", "multiplexer", "conpty", "windows", "pty"]
+categories = ["command-line-utilities", "os::windows-apis"]
+
+[lib]
+name = "conmux"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+# capture() 的 CaptureResult.data_base64 编码（cutover 2b-3b）。
+base64 = "0.22"
+# 后续增量：tokio（按需）
+
+# cutover 2b（MF-4 JobObject + ConPTY 后端）。windows-sys（非整 windows crate，体积
+# 纪律 §3.1）+ portable-pty 0.9（D2 裁决）。仅 Windows 编译——conmux 纯逻辑层跨平台可测。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",         # CreateJobObjectW 的 SECURITY_ATTRIBUTES 参数需要
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+# 2b-2 起为生产依赖（WindowsPaneSession）。0.9 无条件设 INHERIT_CURSOR → 读线程必须
+# 应答 DSR ESC[6n，否则启动阻塞（spike research/conpty-spike-2026-06-11 实证）。
+portable-pty = "0.9"
+
+[dev-dependencies]
+serde_json = "1"
