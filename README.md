@@ -4,7 +4,7 @@
 
 conmux is an independent product, not an internal component. It is the terminal foundation that [Conflux](https://github.com/Verson1daddy/Conflux) (a multi-agent CLI workbench) is built on — but it stands on its own: if you download conmux you get a terminal multiplexer, nothing else.
 
-> **Status: early development (v0.1.x).** What exists today is the mechanism-layer Rust library that already powers Conflux in production use: real ConPTY panes, whole-tree process supervision, a single audited input path, scrollback/capture, themes, and a frozen wire-protocol type layer — backed by 60+ tests including real-process integration tests. The standalone daemon (detach/persistence), native GUI shell, and cross-WSL session unification are the active roadmap. APIs outside the protocol layer are unstable.
+> **Status: early development (v0.1.x).** The mechanism-layer Rust library already powers Conflux in production use: real ConPTY panes, whole-tree process supervision, a single audited input path, scrollback/capture, themes, and a frozen wire-protocol type layer. On top of it, the **standalone daemon now exists** — named-pipe IPC, detach/attach with seamless VT replay, per-connection audit, backpressure — so *close the client, the pane keeps running; reattach and the screen is intact*. Backed by 110+ tests including real-pipe + real-process integration tests. The native GUI shell and cross-WSL session unification are the active roadmap. Interactive CLI `attach` keystroke handling is implemented but still gets manual-terminal verification before being called done. APIs outside the protocol layer are unstable.
 
 ## Why conmux
 
@@ -24,11 +24,20 @@ Existing "native tmux for Windows" projects deliberately route *around* WSL. con
 - **Scrollback & capture** — line-indexed scrollback, capture with ANSI stripping switch and effectively-full detection.
 - **Event stream** — `PaneOutput` (sequenced) / `PaneExited` (exact exit codes) via a pluggable event sink.
 - **Themes** — built-in registry (base24-style slots), runtime switchable, broadcast on change.
-- **Protocol types** — frozen request/op/reply/payload wire types (`deny_unknown_fields`), ready for the daemon.
+- **Protocol types** — frozen request/op/reply/payload wire types (`deny_unknown_fields`).
+- **Daemon (detach/attach)** — one daemon holds every ConPTY; thin CLI/GUI clients connect over a named pipe. `conmux new / ls / send / capture / kill / resize / respawn / attach / theme / kill-server`. Detach a client (or kill it outright) and the pane survives; reattach replays the exact screen — scrollback **and** terminal mode state (alt-screen, cursor, mouse) — with no dropped or duplicated bytes.
+
+## Security & threat model
+
+conmux's trust boundary is the **current user**, enforced by the named pipe's DACL (only the current user's SID is granted access) plus `PIPE_REJECT_REMOTE_CLIENTS` and first-instance squatting protection. Honest scope:
+
+- **Same-user is not an OS-enforced wall.** Any process running as you can already read your memory or kill your processes. The pipe-layer identity checks (client identity is fail-closed; the client verifies the daemon's process image) exist to *raise the bar and stay auditable* — not to defeat malicious code that already runs as you. Pipe-name squatting degrades, at worst, to denial of service (the daemon won't start), never to a silent hijack.
+- **Lifecycle semantics — "close the window, nothing dies" means the *client* window.** A pane survives its clients detaching or being killed. It does **not** survive the daemon: `conmux kill-server`, or the daemon crashing, drops every Job Object and terminates every pane tree (the flip side of the zero-orphan guarantee). This is deliberate and stated, not a leak.
+- **Local only.** Connection-level audit (`{pid, image_path, timestamp}`) is written to a local rolling log (`%LOCALAPPDATA%\conmux\daemon.log`). No accounts, no telemetry, nothing leaves the machine.
 
 ## Roadmap (short version)
 
-- **M2 — daemon**: detach/attach, named-pipe IPC, VT replay. "Close the window, nothing dies."
+- **M2 — daemon** *(landed: detach/attach + named-pipe IPC + VT replay; cross-daemon-restart persistence is out of scope by design)*.
 - **M3 — native GUI shell**: tabs/panes, theme switching as a first-class control, tab tear-out & merge, collapse-to-dot.
 - **M4 — cross-WSL**: WSL domains (`local` / `wsl:<distro>`), Windows-side daemon owning all ConPTYs, an in-WSL signal proxy for graceful cross-boundary termination, path translation.
 

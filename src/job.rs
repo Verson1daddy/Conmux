@@ -6,6 +6,9 @@
 
 use crate::ConmuxError;
 
+/// **Stability: unstable** — may change without notice（M1 契约 §1.3-③：公开 trait 当前
+/// 无外部注入口，保留 pub 供 M2 daemon/高级嵌入者，届时裁决收紧与否）。
+///
 /// 单个 pane 的进程监管器。fail-closed 四条款语义见契约 §3.1（实现侧保证）。
 pub trait ProcessSupervisor: Send + Sync {
     /// 将 pid 纳入监管（Windows = AssignProcessToJobObject）。
@@ -14,6 +17,8 @@ pub trait ProcessSupervisor: Send + Sync {
     fn kill_tree(&self) -> Result<(), ConmuxError>;
 }
 
+/// **Stability: unstable** — may change without notice。
+///
 /// 监管器工厂：PaneHost 每次 spawn 创建一个新监管器（每 pane 一个 Job）。
 ///
 /// 抽象成工厂而非具体类型，使 PaneHost 不绑定 Windows、便于 mock 测试机制层。
@@ -45,6 +50,8 @@ mod windows_impl {
     /// **生命周期语义（关窗即丢，契约 §2 / D4）**：job 句柄设 KILL_ON_JOB_CLOSE，
     /// 最后一个句柄关闭（= 本结构体 drop）即整树终结全部成员进程。故 Pane 私有持有
     /// 本监管器、随 Pane drop 释放 = app 退出/崩溃零孤儿。
+    ///
+    /// **Stability: unstable** — may change without notice。
     pub struct JobObjectSupervisor {
         job: HANDLE,
     }
@@ -130,6 +137,8 @@ mod windows_impl {
     }
 
     /// 生产工厂：每次 spawn 创建一个新 JobObjectSupervisor。
+    ///
+    /// **Stability: unstable** — may change without notice。
     pub struct JobObjectSupervisorFactory;
 
     impl SupervisorFactory for JobObjectSupervisorFactory {

@@ -116,6 +116,12 @@ pub(crate) struct LineIndexedBuffer {
     line_starts: VecDeque<(u64, u64)>,
     /// 下一个将被分配的行号 = 当前正在写入的（未完成）行号。
     next_abs_line: u64,
+    /// **PaneOutput 序号**（attach 无缝拼接锚，M2 设计 D-6）。从 0 起，`append_and_seq`
+    /// 每次 +1（首块 → 1，per-pane 严格单调）。**与字节追加在同一锁域内原子绑定**：
+    /// 任何 emit 的 seq=S 对应的 ring 状态必含该块字节；attach 快照在锁内同时读
+    /// `read_all_bytes()` 与 `seq()`，保证 (历史, last_seq) 原子对应——客户端喂历史后
+    /// 只喂 `seq > last_seq` 的 live 帧即无丢帧无重帧。
+    seq: u64,
 }
 
 impl LineIndexedBuffer {
@@ -126,6 +132,7 @@ impl LineIndexedBuffer {
             bytes: OutputBuffer::new(capacity_bytes),
             line_starts,
             next_abs_line: 0,
+            seq: 0,
         }
     }
 
@@ -145,6 +152,20 @@ impl LineIndexedBuffer {
             }
         }
         self.prune();
+    }
+
+    /// 追加一段输出并返回**与之原子绑定**的新 PaneOutput 序号（D-6）。读泵在
+    /// scrollback 锁内调用本方法取 seq，锁外 emit `PaneOutput{seq}`——保证 seq=S 的帧
+    /// 对应的 ring 状态必已含本块字节（attach 快照锁内同读 `read_all_bytes`+`seq` 即原子）。
+    pub(crate) fn append_and_seq(&mut self, chunk: &[u8]) -> u64 {
+        self.append(chunk);
+        self.seq += 1;
+        self.seq
+    }
+
+    /// 当前 PaneOutput 序号高水位（attach 快照 last_seq）。
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
     }
 
     /// 当前（未完成）行的行号——写入侧高水位。
@@ -317,6 +338,25 @@ mod tests {
         assert_eq!(buf.current_line(), 0);
         // 行 0 起始（abs 0）已被覆盖 → 读不到完整行
         assert_eq!(buf.read_lines(0, 1), None);
+    }
+
+    #[test]
+    fn append_and_seq_is_monotonic_and_atomic_with_bytes() {
+        // D-6：seq 从 1 起严格单调；每个 seq 对应的 ring 已含该块字节。
+        let mut buf = LineIndexedBuffer::new(1024);
+        assert_eq!(buf.seq(), 0, "初始 seq=0（尚无 emit）");
+        let s1 = buf.append_and_seq(b"first\n");
+        assert_eq!(s1, 1);
+        assert_eq!(buf.seq(), 1);
+        // seq=1 时快照（read_all_bytes + seq）必含 first 块。
+        assert!(buf.read_all_bytes().windows(5).any(|w| w == b"first"));
+        let s2 = buf.append_and_seq(b"second\n");
+        assert_eq!(s2, 2);
+        assert_eq!(buf.seq(), 2);
+        // 快照 seq=2 含 first+second（原子对应）。
+        let snap = buf.read_all_bytes();
+        assert!(snap.windows(6).any(|w| w == b"second"));
+        assert!(snap.windows(5).any(|w| w == b"first"));
     }
 
     #[test]

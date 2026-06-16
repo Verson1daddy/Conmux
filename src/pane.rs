@@ -11,7 +11,7 @@
 //! 后端（portable-pty 0.9 + JobObjectSupervisor + 读线程 + capture）在系统集成子步（2b）落地。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::event::{MuxNotify, PaneEventSink};
 use crate::inject::{InjectionContext, InjectionHook};
@@ -19,6 +19,21 @@ use crate::job::{ProcessSupervisor, SupervisorFactory};
 use crate::scrollback::{LineIndexedBuffer, DEFAULT_BUFFER_CAPACITY};
 use crate::types::{InjectionSource, PaneId, PaneLifecycle, PaneSize, PaneState, ScrollbackInfo};
 use crate::ConmuxError;
+
+/// 中毒容忍锁恢复（H-3 / M2a 红队 M2a-M1）。
+///
+/// 持锁线程 panic 会毒化 `Mutex`；裸 `.expect()` 会让之后**每个** `.lock()` 级联 panic，
+/// daemon 沦为「全 pane 不可管理的活死状态」。本助手以 `into_inner()` 取回**被守护数据**
+/// 续用，单点 panic 不传导成全域锁风暴（daemon 侧 `catch_unwind` 另保证连接线程 panic 不
+/// 越界，二者叠加 = H-3 隔离）。
+///
+/// **为何「恢复续用」而非设计 D-7 的「受控自杀」**：`PaneHost` 是 conmux/conflux **共享库**
+/// ——conflux 在 Tauri 进程内 in-proc 持有它，库层 `process::exit` 会杀掉整个 app。受控退出
+/// 是 daemon（独立形态的策略层）的决策，不属机制库。PaneHost 锁内临界区皆短（HashMap
+/// 增删查 / `Arc::clone` / 环形缓冲 memcpy），无破坏性中途态，恢复的数据一致可用。
+fn recover<T>(e: PoisonError<MutexGuard<'_, T>>) -> MutexGuard<'_, T> {
+    e.into_inner()
+}
 
 /// 进程启动规格（契约 §13 空白-1 裁决：spawn cwd 用 `cwd`，与 `PaneState.working_dir`
 /// 展示语义区分）。retrofit 自 conflux `pty/manager.rs` 的 `CommandBuilder`。
@@ -44,6 +59,34 @@ pub struct SpawnRequest {
     pub display_name: Option<String>,
     /// 创建时间（Unix ms，调用方提供以保持可测/可重放确定性）。
     pub created_at: i64,
+}
+
+/// attach 原子快照（M2 设计 D-6）。`PaneHost::attach_snapshot` 在 scrollback 锁内原子取
+/// `(history, last_seq)`，锁外组装；消费方据此重建画面：喂 `mode_preamble` → 喂 `history`
+/// （原始 VT 字节）→ 按 `seq > last_seq` 连续喂 live `PaneOutput`。**承诺面**——嵌入 API +
+/// wire `MuxPayload::AttachSnapshot` 的源数据（后者把字节 base64）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneSnapshot {
+    /// 非默认 VT 模式位合成前导（alt-screen/光标/鼠标/bracketed paste），见 [`PaneHost::mode_preamble`]。
+    pub mode_preamble: Vec<u8>,
+    /// ring 内全部有效**原始字节**（含 VT 序列，供 xterm 重放自愈）。
+    pub history: Vec<u8>,
+    /// 与 `history` **原子对应**的 PaneOutput 序号高水位（live 流去重锚，D-6）。
+    pub last_seq: u64,
+    /// 取快照时的 pane 状态。
+    pub pane_state: PaneState,
+}
+
+/// `attach_snapshot` 在表锁内拷出的标量元字段（出表锁后组装 PaneState 用，避免表锁内读 scrollback）。
+struct SnapshotMeta {
+    adapter_id: String,
+    display_name: Option<String>,
+    lifecycle: PaneLifecycle,
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+    working_dir: String,
+    size: PaneSize,
+    created_at: i64,
 }
 
 // ===== 内部 trait（pub(crate)，不导出——MF-1 隐私墙）=====
@@ -117,12 +160,15 @@ pub(crate) struct Pane {
     created_at: i64,
     /// 行索引 scrollback（读线程 feed；capture / jump-back 后端地基）。
     scrollback: Arc<Mutex<LineIndexedBuffer>>,
+    /// VT 私有模式跟踪（读线程 feed；attach/重放前导合成——M2 spike 裁决）。
+    /// 锁纪律：与 scrollback 同类——纯内存短持有、锁内无 I/O 无回调（表锁例外前提）。
+    modes: Arc<Mutex<crate::modes::ModeTracker>>,
 }
 
 impl Pane {
     fn to_state(&self, pane_id: &PaneId) -> PaneState {
         let (first, last) = {
-            let sb = self.scrollback.lock().expect("scrollback 锁未中毒");
+            let sb = self.scrollback.lock().unwrap_or_else(recover);
             sb.line_range_available()
         };
         PaneState {
@@ -138,7 +184,7 @@ impl Pane {
                 total_bytes: self
                     .scrollback
                     .lock()
-                    .expect("scrollback 锁未中毒")
+                    .unwrap_or_else(recover)
                     .total_bytes(),
                 first_abs_line: first,
                 last_abs_line: last,
@@ -163,6 +209,13 @@ pub(crate) struct PaneHostConfig {
 }
 
 /// 对外门面。私有持有 pane 表；唯一写入口 `inject_stdin`（MF-1）。
+///
+/// **C-2 锁纪律（库级不变量）**：`panes` 表锁是短临界区领导锁——持有期间**禁止**任何
+/// 可能阻塞的调用：session 锁等待、write_all/resize/try_exit_code（ConPTY 节流 / 系统
+/// 调用可长阻塞）、kill_tree、注入钩子。需要 session 的操作一律「句柄取出」（表锁内
+/// clone Arc 后立即释放）再锁外执行；事后写回 pane 字段须重入表锁并以 `Arc::ptr_eq`
+/// 验证代际（respawn 产生同 id 新 pane，旧代际写回一律作废）。违反此纪律 = 单 pane
+/// 阻塞冻结全表、kill 逃生通道被堵（回归测试见 tests 模块 C-2 节）。
 pub struct PaneHost {
     backend: Box<dyn PaneBackend>,
     supervisor_factory: Box<dyn SupervisorFactory>,
@@ -203,7 +256,7 @@ impl PaneHost {
     /// → 注册。assign 失败 ⇒ 不注册（不产生无监管 pane）。读线程/capture 接线在 2b。
     pub fn spawn(&self, req: SpawnRequest) -> Result<PaneId, ConmuxError> {
         {
-            let panes = self.panes.lock().expect("panes 锁未中毒");
+            let panes = self.panes.lock().unwrap_or_else(recover);
             if panes.contains_key(&req.pane_id) {
                 return Err(ConmuxError::SpawnFailed {
                     message: format!("pane_id 已存在: {}", req.pane_id.0),
@@ -225,6 +278,7 @@ impl PaneHost {
         }
 
         let scrollback = Arc::new(Mutex::new(LineIndexedBuffer::new(DEFAULT_BUFFER_CAPACITY)));
+        let modes = Arc::new(Mutex::new(crate::modes::ModeTracker::new()));
 
         // D-1a：session 进入 Arc<Mutex>——inject/poll_exit 在表锁外经此句柄操作。
         let session = Arc::new(Mutex::new(session));
@@ -235,7 +289,7 @@ impl PaneHost {
         #[cfg(windows)]
         if let Some(sink) = self.event_sink.clone() {
             let (writer, reader) = {
-                let mut s = session.lock().expect("session 锁未中毒");
+                let mut s = session.lock().unwrap_or_else(recover);
                 (s.protocol_writer(), s.take_reader())
             };
             if let Some(writer) = writer {
@@ -243,14 +297,17 @@ impl PaneHost {
                     Ok(reader) => {
                         let pane_id = req.pane_id.clone();
                         let sb = Arc::clone(&scrollback);
+                        let md = Arc::clone(&modes);
                         // Weak：kill/drop 后读线程不得延长 session 寿命——否则 master 不释放、
                         // reader 永不 EOF、线程泄漏。upgrade 失败（pane 已移除）⇒ exit_code=None。
                         let session_weak = Arc::downgrade(&session);
                         std::thread::spawn(move || {
-                            let mut seq: u64 = 0;
                             crate::pane_win::pump_reader_with_dsr(reader, writer, |chunk| {
-                                sb.lock().expect("scrollback 锁").append(chunk);
-                                seq += 1;
+                                // D-6：seq 在 scrollback 锁内与字节追加**原子绑定**——保证
+                                // emit 的 seq=S 对应的 ring 状态必含本块，attach 快照锁内同读
+                                // (read_all_bytes, seq) 即原子。emit 在锁外（H-1：序列化/投递不入锁）。
+                                let seq = sb.lock().unwrap_or_else(recover).append_and_seq(chunk);
+                                md.lock().unwrap_or_else(recover).feed(chunk);
                                 sink.on_notify(MuxNotify::PaneOutput {
                                     pane_id: pane_id.clone(),
                                     seq,
@@ -297,11 +354,25 @@ impl PaneHost {
             size: req.size,
             created_at: req.created_at,
             scrollback,
+            modes,
         };
-        self.panes
-            .lock()
-            .expect("panes 锁未中毒")
-            .insert(req.pane_id.clone(), pane);
+        {
+            let mut panes = self.panes.lock().unwrap_or_else(recover);
+            match panes.entry(req.pane_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(pane);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    // 并发同 id spawn 双双越过前置查重（TOCTOU）：fail-closed 终结后到者，
+                    // 不覆盖已注册 pane（覆盖会静默 drop 先到者的监管器 = 静默杀树）。
+                    drop(panes);
+                    let _ = pane.supervisor.kill_tree();
+                    return Err(ConmuxError::SpawnFailed {
+                        message: format!("pane_id 已存在: {}", req.pane_id.0),
+                    });
+                }
+            }
+        }
         Ok(req.pane_id)
     }
 
@@ -326,7 +397,7 @@ impl PaneHost {
     ) -> Result<(), ConmuxError> {
         // 表锁内只取句柄，立即释放（D-1a）。
         let (inject_lock, session) = {
-            let panes = self.panes.lock().expect("panes 锁未中毒");
+            let panes = self.panes.lock().unwrap_or_else(recover);
             let pane = panes
                 .get(pane_id)
                 .ok_or_else(|| ConmuxError::PaneNotFound {
@@ -334,7 +405,7 @@ impl PaneHost {
                 })?;
             (Arc::clone(&pane.inject_lock), Arc::clone(&pane.session))
         };
-        let _serial = inject_lock.lock().expect("inject 锁未中毒");
+        let _serial = inject_lock.lock().unwrap_or_else(recover);
 
         let ctx = InjectionContext {
             pane_id,
@@ -355,7 +426,7 @@ impl PaneHost {
             }
         }
 
-        let result = session.lock().expect("session 锁未中毒").write_all(data);
+        let result = session.lock().unwrap_or_else(recover).write_all(data);
         for hook in &self.hooks {
             hook.after_inject(&ctx, &result);
         }
@@ -366,7 +437,7 @@ impl PaneHost {
     /// （MF-4 cl.4：失败仍清理，调用方据返回的 Err 决定是否标 zombie/上报）。
     pub fn kill(&self, pane_id: &PaneId) -> Result<(), ConmuxError> {
         let pane = {
-            let mut panes = self.panes.lock().expect("panes 锁未中毒");
+            let mut panes = self.panes.lock().unwrap_or_else(recover);
             panes
                 .remove(pane_id)
                 .ok_or_else(|| ConmuxError::PaneNotFound {
@@ -379,13 +450,15 @@ impl PaneHost {
 
     /// 在同一 pane_id 下重起（先 kill_tree 旧的——若存在——再 spawn）。
     pub fn respawn(&self, pane_id: &PaneId, req: SpawnRequest) -> Result<(), ConmuxError> {
-        // 旧 pane 存在则整树终结（忽略 kill 错误：可能已自退）。
-        if let Some(old) = self
+        // C-2：先 let 绑定再 kill——把 lock() 直接嵌进 if-let 头会让表锁 guard 延寿到
+        // 块尾（临时生命周期延展），kill_tree 慢路径下冻结全表。
+        let old = self
             .panes
             .lock()
-            .expect("panes 锁未中毒")
-            .remove(pane_id)
-        {
+            .unwrap_or_else(recover)
+            .remove(pane_id);
+        // 旧 pane 存在则整树终结（忽略 kill 错误：可能已自退）。
+        if let Some(old) = old {
             let _ = old.supervisor.kill_tree();
         }
         // req.pane_id 应与 pane_id 一致（调用方保证）。
@@ -393,14 +466,25 @@ impl PaneHost {
     }
 
     pub fn resize(&self, pane_id: &PaneId, size: PaneSize) -> Result<(), ConmuxError> {
-        let mut panes = self.panes.lock().expect("panes 锁未中毒");
-        let pane = panes
-            .get_mut(pane_id)
-            .ok_or_else(|| ConmuxError::PaneNotFound {
-                pane_id: pane_id.0.clone(),
-            })?;
-        pane.session.lock().expect("session 锁未中毒").resize(size)?;
-        pane.size = size;
+        // C-2 锁纪律：表锁内只取句柄；session 等待/IO 在锁外（同 inject_stdin D-1a）。
+        let session = {
+            let panes = self.panes.lock().unwrap_or_else(recover);
+            let pane = panes
+                .get(pane_id)
+                .ok_or_else(|| ConmuxError::PaneNotFound {
+                    pane_id: pane_id.0.clone(),
+                })?;
+            Arc::clone(&pane.session)
+        };
+        session.lock().unwrap_or_else(recover).resize(size)?;
+        // 写回 size：重入表锁并以 Arc::ptr_eq 验证代际——句柄取出期间 pane 可能被
+        // respawn（同 id 新 pane），旧代际的写回一律作废。
+        let mut panes = self.panes.lock().unwrap_or_else(recover);
+        if let Some(pane) = panes.get_mut(pane_id) {
+            if Arc::ptr_eq(&pane.session, &session) {
+                pane.size = size;
+            }
+        }
         Ok(())
     }
 
@@ -411,37 +495,145 @@ impl PaneHost {
     /// 与 `PaneExited` 事件互补：ConPTY reader 在 child 退出后**可能不返回 EOF**（实测
     /// 已知），事件可能永不到达——消费方（conflux `is_process_exited` 轮询）必须有此兜底。
     pub fn poll_exit(&self, pane_id: &PaneId) -> Result<Option<i32>, ConmuxError> {
-        let mut panes = self.panes.lock().expect("panes 锁未中毒");
-        let pane = panes
-            .get_mut(pane_id)
-            .ok_or_else(|| ConmuxError::PaneNotFound {
+        // C-2 锁纪律：表锁内只读 lifecycle + 取句柄；try_exit_code（可能阻塞于系统调用）
+        // 在锁外执行。
+        let session = {
+            let panes = self.panes.lock().unwrap_or_else(recover);
+            let pane = panes
+                .get(pane_id)
+                .ok_or_else(|| ConmuxError::PaneNotFound {
+                    pane_id: pane_id.0.clone(),
+                })?;
+            if let PaneLifecycle::Exited(code) = pane.lifecycle {
+                return Ok(Some(code));
+            }
+            Arc::clone(&pane.session)
+        };
+        // try_lock 而非 lock：poll 语义是"本轮探测"，session 忙（如 write_all 阻塞于
+        // ConPTY 节流）时返回"不可判定"让下轮重试——否则顺序轮询多 pane 的消费方会被
+        // 单个忙 pane 卡死整轮（契约 L-1/4.3.1 看门狗要求 poll_exit 自身限时完成）。
+        let code = match session.try_lock() {
+            Ok(mut s) => s.try_exit_code(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            // 中毒容忍（M2a-M1）：取回守护数据续探，不级联 panic（与 `recover` 同策略）。
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().try_exit_code(),
+        };
+        let Some(c) = code else {
+            return Ok(None);
+        };
+        // 写回：代际验证（与读线程 Weak 守卫同源语义）——句柄取出期间 pane 被
+        // respawn/kill 时，旧代际的迟到退出码不得污染同 id 新 pane。
+        let mut panes = self.panes.lock().unwrap_or_else(recover);
+        match panes.get_mut(pane_id) {
+            Some(pane) if Arc::ptr_eq(&pane.session, &session) => {
+                pane.lifecycle = PaneLifecycle::Exited(c);
+                pane.exit_code = Some(c);
+                Ok(Some(c))
+            }
+            // 新代际运行中：旧结果作废，按当前代际报"未退出"。
+            Some(_) => Ok(None),
+            // pane 已被 kill：与"稍后调用"同语义。
+            None => Err(ConmuxError::PaneNotFound {
                 pane_id: pane_id.0.clone(),
-            })?;
-        if let PaneLifecycle::Exited(code) = pane.lifecycle {
-            return Ok(Some(code));
+            }),
         }
-        let code = pane
-            .session
-            .lock()
-            .expect("session 锁未中毒")
-            .try_exit_code();
-        if let Some(c) = code {
-            pane.lifecycle = PaneLifecycle::Exited(c);
-            pane.exit_code = Some(c);
-        }
-        Ok(code)
+    }
+
+    /// attach/重放前导（M2 spike 裁决）：当前 pane 非默认 VT 模式位的合成序列
+    /// （alt-screen/光标可见性/鼠标/bracketed paste/DECCKM）。重放协议 =
+    /// **本前导 + capture 字节**——模态状态是 ring 任意起点重放下唯一不自愈的部分
+    /// （文本/光标经 TUI 绝对定位重绘自愈，spike 实证）。空 = 全默认态。
+    pub fn mode_preamble(&self, pane_id: &PaneId) -> Result<Vec<u8>, ConmuxError> {
+        // C-2 锁纪律：表锁内只取句柄；modes 锁为纯内存短持有。
+        let modes = {
+            let panes = self.panes.lock().unwrap_or_else(recover);
+            let pane = panes
+                .get(pane_id)
+                .ok_or_else(|| ConmuxError::PaneNotFound {
+                    pane_id: pane_id.0.clone(),
+                })?;
+            Arc::clone(&pane.modes)
+        };
+        let preamble = modes.lock().unwrap_or_else(recover).preamble();
+        Ok(preamble)
+    }
+
+    /// attach 原子快照（M2 设计 D-6）。**无缝拼接不变量**：`history` 字节与 `last_seq` 在
+    /// scrollback 锁内**同时**读取（原子对应），锁内仅做 memcpy 克隆 + 读 seq（H-1：base64 /
+    /// JSON / 帧写出一律由调用方在锁外做，避免 1MB 级 CPU 工作进锁饿死读泵）。
+    ///
+    /// 调用方（daemon Attach 处理）须**先注册订阅、后取快照**：注册到快照间到达的事件按
+    /// `seq > last_seq` 过滤即去重，保证无丢帧无重帧（D-6 客户端拼接契约）。
+    pub fn attach_snapshot(&self, pane_id: &PaneId) -> Result<PaneSnapshot, ConmuxError> {
+        // C-2 锁纪律：表锁内只取句柄 + 拷贝标量元字段，立即释放（不在表锁内读 scrollback）。
+        let (scrollback, modes, meta) = {
+            let panes = self.panes.lock().unwrap_or_else(recover);
+            let pane = panes
+                .get(pane_id)
+                .ok_or_else(|| ConmuxError::PaneNotFound {
+                    pane_id: pane_id.0.clone(),
+                })?;
+            (
+                Arc::clone(&pane.scrollback),
+                Arc::clone(&pane.modes),
+                SnapshotMeta {
+                    adapter_id: pane.adapter_id.clone(),
+                    display_name: pane.display_name.clone(),
+                    lifecycle: pane.lifecycle.clone(),
+                    pid: pane.pid,
+                    exit_code: pane.exit_code,
+                    working_dir: pane.working_dir.clone(),
+                    size: pane.size,
+                    created_at: pane.created_at,
+                },
+            )
+        };
+        // 原子读 scrollback：(history, last_seq, 行窗) 同锁内取（H-1：仅 memcpy + 读字段）。
+        let (history, last_seq, sb_info) = {
+            let g = scrollback.lock().unwrap_or_else(recover);
+            let (first, last) = g.line_range_available();
+            (
+                g.read_all_bytes(),
+                g.seq(),
+                ScrollbackInfo {
+                    total_bytes: g.total_bytes(),
+                    first_abs_line: first,
+                    last_abs_line: last,
+                },
+            )
+        };
+        // 模式前导（独立短内存锁，与 scrollback 不嵌套）。
+        let mode_preamble = modes.lock().unwrap_or_else(recover).preamble();
+        let pane_state = PaneState {
+            pane_id: pane_id.clone(),
+            adapter_id: meta.adapter_id,
+            display_name: meta.display_name,
+            lifecycle: meta.lifecycle,
+            pid: meta.pid,
+            exit_code: meta.exit_code,
+            working_dir: meta.working_dir,
+            size: meta.size,
+            scrollback: sb_info,
+            created_at: meta.created_at,
+        };
+        Ok(PaneSnapshot {
+            mode_preamble,
+            history,
+            last_seq,
+            pane_state,
+        })
     }
 
     /// 对账/死亡检测用。
     pub fn list_panes(&self) -> Vec<PaneState> {
-        let panes = self.panes.lock().expect("panes 锁未中毒");
+        let panes = self.panes.lock().unwrap_or_else(recover);
         panes.iter().map(|(id, pane)| pane.to_state(id)).collect()
     }
 
     /// 单 pane 状态查询（V1-core：行级 jump-back 的 scrollback 高水位取数路径——
     /// ingest 每事件一查，避免 list_panes O(n)）。
     pub fn pane_state(&self, pane_id: &PaneId) -> Result<PaneState, ConmuxError> {
-        let panes = self.panes.lock().expect("panes 锁未中毒");
+        let panes = self.panes.lock().unwrap_or_else(recover);
         panes
             .get(pane_id)
             .map(|pane| pane.to_state(pane_id))
@@ -460,13 +652,13 @@ impl PaneHost {
         req: crate::capture::CaptureRequest,
     ) -> Result<crate::capture::CaptureResult, ConmuxError> {
         use crate::capture::CaptureRange;
-        let panes = self.panes.lock().expect("panes 锁未中毒");
+        let panes = self.panes.lock().unwrap_or_else(recover);
         let pane = panes
             .get(&req.pane_id)
             .ok_or_else(|| ConmuxError::PaneNotFound {
                 pane_id: req.pane_id.0.clone(),
             })?;
-        let sb = pane.scrollback.lock().expect("scrollback 锁未中毒");
+        let sb = pane.scrollback.lock().unwrap_or_else(recover);
         let (first, last) = sb.line_range_available();
 
         // 取字节 + truncated 判定（LineRange 被环覆盖 → None → truncated）。
@@ -532,6 +724,10 @@ mod tests {
         exit_code: Option<i32>,
         /// 红队 MF-A：记录 kill_best_effort 被调次数（assign 失败应触发）。
         kill_best_effort_calls: u32,
+        /// C-2：write_all 进入后停在此 gate（模拟 ConPTY 节流下的长阻塞写）。
+        write_gate: Option<Arc<Gate>>,
+        /// C-2：try_exit_code 进入后停在此 gate（构造代际竞态窗口）。
+        exit_gate: Option<Arc<Gate>>,
     }
 
     #[derive(Clone)]
@@ -564,10 +760,19 @@ mod tests {
             Ok(())
         }
         fn write_all(&mut self, data: &[u8]) -> Result<(), ConmuxError> {
+            // gate 等待在 state 锁外（否则 mock 自身制造无关死锁）。
+            let gate = self.state.lock().unwrap().write_gate.clone();
+            if let Some(g) = gate {
+                g.enter_and_wait();
+            }
             self.state.lock().unwrap().written.push(data.to_vec());
             Ok(())
         }
         fn try_exit_code(&mut self) -> Option<i32> {
+            let gate = self.state.lock().unwrap().exit_gate.clone();
+            if let Some(g) = gate {
+                g.enter_and_wait();
+            }
             self.state.lock().unwrap().exit_code
         }
         fn kill_best_effort(&mut self) {
@@ -596,6 +801,8 @@ mod tests {
         kill_tree_calls: u32,
         assign_should_fail: bool,
         kill_tree_should_fail: bool,
+        /// C-2：kill_tree 进入后停在此 gate（模拟 TerminateJobObject 慢路径）。
+        kill_gate: Option<Arc<Gate>>,
     }
 
     struct MockSupervisor {
@@ -613,6 +820,10 @@ mod tests {
             Ok(())
         }
         fn kill_tree(&self) -> Result<(), ConmuxError> {
+            let gate = self.rec.lock().unwrap().kill_gate.clone();
+            if let Some(g) = gate {
+                g.enter_and_wait();
+            }
             let mut r = self.rec.lock().unwrap();
             r.kill_tree_calls += 1;
             if r.kill_tree_should_fail {
@@ -745,6 +956,247 @@ mod tests {
             f.host.spawn(req("dup")),
             Err(ConmuxError::SpawnFailed { .. })
         ));
+    }
+
+    // ===== C-2 锁纪律：表锁=短临界区，阻塞操作一律句柄取出后锁外执行 =====
+
+    /// 可控阻塞门：mock 在临界路径上 enter_and_wait 停住，测试线程 wait_entered
+    /// 确认到位后做断言，open 放行。
+    #[derive(Default)]
+    struct Gate {
+        inner: StdMutex<GateState>,
+        cv: std::sync::Condvar,
+    }
+    #[derive(Default)]
+    struct GateState {
+        entered: bool,
+        open: bool,
+    }
+    impl Gate {
+        fn enter_and_wait(&self) {
+            let mut g = self.inner.lock().unwrap();
+            g.entered = true;
+            self.cv.notify_all();
+            while !g.open {
+                g = self.cv.wait(g).unwrap();
+            }
+        }
+        fn wait_entered(&self, timeout: std::time::Duration) -> bool {
+            let g = self.inner.lock().unwrap();
+            let (_g, r) = self
+                .cv
+                .wait_timeout_while(g, timeout, |s| !s.entered)
+                .unwrap();
+            !r.timed_out()
+        }
+        fn open(&self) {
+            let mut g = self.inner.lock().unwrap();
+            g.open = true;
+            self.cv.notify_all();
+        }
+    }
+
+    /// 在独立线程跑 op，超时未完成返回 None（探测"被表锁冻结"而不挂死测试进程）。
+    fn completes_within<T: Send + 'static>(
+        timeout: std::time::Duration,
+        op: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(op());
+        });
+        rx.recv_timeout(timeout).ok()
+    }
+
+    const FREEZE_PROBE: std::time::Duration = std::time::Duration::from_secs(2);
+    const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// C-2 核心场景：某 pane 的 session 写阻塞（ConPTY 节流）时，resize 同 pane 不得
+    /// 持表锁等 session 锁——否则 list/spawn/kill 全部冻结、逃生通道被堵。
+    #[test]
+    fn blocked_write_with_concurrent_resize_does_not_freeze_host() {
+        let Fixture {
+            host,
+            session_state,
+            ..
+        } = fixture_with_pid(1);
+        let host = Arc::new(host);
+        host.spawn(req("a")).unwrap();
+
+        let gate = Arc::new(Gate::default());
+        session_state.lock().unwrap().write_gate = Some(Arc::clone(&gate));
+
+        // T1：inject——mock write_all 持 session 锁停在 gate（模拟长阻塞写）。
+        let h1 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || {
+                let _ = host.inject_stdin(&PaneId("a".into()), b"x", InjectionSource::UserDirect);
+            })
+        };
+        assert!(gate.wait_entered(GATE_WAIT), "T1 未进入 write_all");
+
+        // T2：resize 同 pane——修复后应在表锁外等 session 锁。
+        let h2 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || {
+                let _ = host.resize(&PaneId("a".into()), PaneSize { rows: 30, cols: 100 });
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        {
+            let host = Arc::clone(&host);
+            assert!(
+                completes_within(FREEZE_PROBE, move || host.list_panes()).is_some(),
+                "list_panes 被冻结：resize 在表锁内等 session 锁（C-2）"
+            );
+        }
+        {
+            let host = Arc::clone(&host);
+            assert!(
+                completes_within(FREEZE_PROBE, move || host.spawn(req("b"))).is_some(),
+                "spawn 被冻结（C-2）"
+            );
+        }
+        {
+            let host = Arc::clone(&host);
+            assert!(
+                completes_within(FREEZE_PROBE, move || host.kill(&PaneId("a".into()))).is_some(),
+                "kill 逃生通道被堵（C-2）"
+            );
+        }
+
+        gate.open();
+        h1.join().unwrap();
+        h2.join().unwrap();
+    }
+
+    /// 同场景的 poll_exit 变体：session 忙时 poll_exit 不得冻结表。
+    #[test]
+    fn blocked_write_with_concurrent_poll_exit_does_not_freeze_host() {
+        let Fixture {
+            host,
+            session_state,
+            ..
+        } = fixture_with_pid(1);
+        let host = Arc::new(host);
+        host.spawn(req("a")).unwrap();
+
+        let gate = Arc::new(Gate::default());
+        session_state.lock().unwrap().write_gate = Some(Arc::clone(&gate));
+
+        let h1 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || {
+                let _ = host.inject_stdin(&PaneId("a".into()), b"x", InjectionSource::UserDirect);
+            })
+        };
+        assert!(gate.wait_entered(GATE_WAIT), "T1 未进入 write_all");
+
+        // poll_exit 自身限时完成（契约 4.3.1）：session 忙 ⇒ try_lock 让路，
+        // 返回"本轮不可判定"（Ok(None)），不卡轮询方。
+        {
+            let host = Arc::clone(&host);
+            let polled = completes_within(FREEZE_PROBE, move || {
+                host.poll_exit(&PaneId("a".into()))
+            });
+            assert!(
+                matches!(polled, Some(Ok(None))),
+                "poll_exit 被忙 session 卡住或误报退出：{polled:?}"
+            );
+        }
+        {
+            let host = Arc::clone(&host);
+            assert!(
+                completes_within(FREEZE_PROBE, move || host.list_panes()).is_some(),
+                "list_panes 被冻结：poll_exit 在表锁内等 session 锁（C-2）"
+            );
+        }
+
+        gate.open();
+        h1.join().unwrap();
+    }
+
+    /// 代际守卫（与读线程 weak 守卫同源的语义，poll_exit 路径）：句柄取出后、写回前
+    /// pane 被 respawn——旧代际的迟到退出码不得污染同 id 新 pane。
+    #[test]
+    fn poll_exit_late_result_does_not_pollute_respawned_pane() {
+        let Fixture {
+            host,
+            session_state,
+            ..
+        } = fixture_with_pid(7);
+        let host = Arc::new(host);
+        host.spawn(req("a")).unwrap();
+
+        let gate = Arc::new(Gate::default());
+        {
+            let mut s = session_state.lock().unwrap();
+            s.exit_gate = Some(Arc::clone(&gate));
+            s.exit_code = Some(7);
+        }
+
+        // T1：poll_exit——取出旧代际句柄后停在 try_exit_code。
+        let h1 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || host.poll_exit(&PaneId("a".into())))
+        };
+        assert!(gate.wait_entered(GATE_WAIT), "T1 未进入 try_exit_code");
+
+        // 新代际不需要 gate（mock state 共享，先清掉）。
+        session_state.lock().unwrap().exit_gate = None;
+
+        // 同 id respawn → 新代际。修复前：T1 持表锁停在 try_exit_code ⇒ respawn 冻结。
+        {
+            let host = Arc::clone(&host);
+            assert!(
+                completes_within(FREEZE_PROBE, move || host.respawn(&PaneId("a".into()), req("a")))
+                    .is_some(),
+                "respawn 被冻结：poll_exit 在表锁内等 session（C-2）"
+            );
+        }
+
+        gate.open();
+        let res = h1.join().unwrap();
+        // 迟到结果按当前代际语义返回 None；新 pane 不得被标 Exited。
+        assert_eq!(res.unwrap(), None, "旧代际退出码泄漏给调用方");
+        let st = host.pane_state(&PaneId("a".into())).unwrap();
+        assert_eq!(
+            st.lifecycle,
+            PaneLifecycle::Running,
+            "旧代际退出码污染了 respawn 后的新 pane（C-2 代际守卫）"
+        );
+        assert_eq!(st.exit_code, None);
+    }
+
+    /// respawn 的 kill_tree 必须在表锁外执行（if-let 临时 guard 延寿陷阱）。
+    #[test]
+    fn respawn_kill_tree_runs_outside_table_lock() {
+        let Fixture { host, sup_rec, .. } = fixture_with_pid(1);
+        let host = Arc::new(host);
+        host.spawn(req("a")).unwrap();
+
+        let gate = Arc::new(Gate::default());
+        sup_rec.lock().unwrap().kill_gate = Some(Arc::clone(&gate));
+
+        let h1 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || host.respawn(&PaneId("a".into()), req("a")))
+        };
+        assert!(gate.wait_entered(GATE_WAIT), "T1 未进入 kill_tree");
+
+        {
+            let host = Arc::clone(&host);
+            assert!(
+                completes_within(FREEZE_PROBE, move || host.list_panes()).is_some(),
+                "list_panes 被冻结：respawn 的 kill_tree 在表锁内执行（C-2）"
+            );
+        }
+
+        // 放行前清掉 gate，避免 respawn 内第二次 kill_tree（不存在）或后续清理受扰。
+        sup_rec.lock().unwrap().kill_gate = None;
+        gate.open();
+        h1.join().unwrap().unwrap();
     }
 
     #[test]
@@ -1171,6 +1623,59 @@ mod tests {
             host.kill(&PaneId("w2".into())).unwrap();
         }
 
+        /// mode_preamble（M2 重放）：真实 ConPTY 进程发 `?1049h?25l` 停在 alt-screen
+        /// → 读线程喂 ModeTracker → 前导含两模式位；kill 后 PaneNotFound。
+        #[test]
+        fn new_windows_mode_preamble_tracks_alt_screen() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let host = PaneHost::new_windows(
+                vec![],
+                Arc::new(CollectSink {
+                    events: Arc::clone(&events),
+                }),
+            );
+            let req = SpawnRequest {
+                pane_id: PaneId("wm".into()),
+                command: CommandSpec {
+                    program: "powershell.exe".into(),
+                    args: vec![
+                        "-NoProfile".into(),
+                        "-Command".into(),
+                        // 进 alt-screen + 隐藏光标后驻留（模拟 TUI 运行中）
+                        "Write-Host ([char]27+'[?1049h'+[char]27+'[?25l') -NoNewline; Start-Sleep -Seconds 8"
+                            .into(),
+                    ],
+                    cwd: None,
+                    env: vec![],
+                },
+                size: PaneSize { rows: 24, cols: 80 },
+                adapter_id: "shell".into(),
+                display_name: None,
+                created_at: 0,
+            };
+            host.spawn(req).unwrap();
+
+            // 轮询等模式位被跟踪到（ConPTY 改写不影响 DECSET 透传，spike 实证）。
+            let pane_id = PaneId("wm".into());
+            let deadline = std::time::Instant::now() + Duration::from_secs(6);
+            let preamble = loop {
+                let p = host.mode_preamble(&pane_id).expect("pane 应存在");
+                if !p.is_empty() || std::time::Instant::now() > deadline {
+                    break p;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let s = String::from_utf8_lossy(&preamble);
+            assert!(s.contains("[?1049h"), "前导应含 alt-screen 位，实际: {s:?}");
+            assert!(s.contains("[?25l"), "前导应含光标隐藏位，实际: {s:?}");
+
+            host.kill(&pane_id).unwrap();
+            assert!(matches!(
+                host.mode_preamble(&pane_id),
+                Err(ConmuxError::PaneNotFound { .. })
+            ));
+        }
+
         /// capture：spawn echo → 输出进 scrollback → capture(All, ansi=false) 读回含 marker。
         #[test]
         fn new_windows_capture_reads_scrollback() {
@@ -1216,6 +1721,54 @@ mod tests {
             ));
 
             host.kill(&PaneId("w3".into())).unwrap();
+        }
+
+        /// D-6：attach_snapshot 取回原始 VT 历史 + last_seq>0，且 last_seq 与收到的最后一个
+        /// PaneOutput.seq 一致（原子对应）。未知 pane → PaneNotFound。
+        #[test]
+        fn new_windows_attach_snapshot_history_and_seq() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let host = PaneHost::new_windows(
+                vec![],
+                Arc::new(CollectSink {
+                    events: Arc::clone(&events),
+                }),
+            );
+            host.spawn(win_req("ws", "conmux-attach-marker")).unwrap();
+            std::thread::sleep(Duration::from_millis(1800));
+
+            let snap = host
+                .attach_snapshot(&PaneId("ws".into()))
+                .expect("attach_snapshot 应成功");
+            let text = String::from_utf8_lossy(&snap.history);
+            assert!(
+                text.contains("conmux-attach-marker"),
+                "history 应含原始 VT 输出，实际:\n{text}"
+            );
+            assert!(snap.last_seq > 0, "有输出后 last_seq 应 > 0");
+            assert_eq!(snap.pane_state.pane_id, PaneId("ws".into()));
+
+            // last_seq 应等于收到的最后一个 PaneOutput 的 seq（原子对应，无丢无重）。
+            let max_emitted_seq = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    MuxNotify::PaneOutput { seq, .. } => Some(*seq),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            assert_eq!(
+                snap.last_seq, max_emitted_seq,
+                "快照 last_seq 应与最后 emit 的 PaneOutput.seq 一致（D-6 原子）"
+            );
+
+            assert!(matches!(
+                host.attach_snapshot(&PaneId("nope".into())),
+                Err(ConmuxError::PaneNotFound { .. })
+            ));
+            host.kill(&PaneId("ws".into())).unwrap();
         }
 
         /// D-2a：自然退出后 PaneExited 事件携带精确退出码 + poll_exit 兜底返回同码。

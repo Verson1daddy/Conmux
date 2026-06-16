@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// conmux 机制层统一错误（`MuxReply::Err` 携带它，故需 serde 可序列化）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[non_exhaustive] // M1 契约 §1.3-④：未来加变体不破坏调用方（变体新增仍走 minor+changelog）
 pub enum ConmuxError {
     /// 目标 pane 不存在（对应现状 `ConfluxError::InstanceNotFound`）。
     #[error("pane 不存在: {pane_id}")]
@@ -37,6 +38,16 @@ pub enum ConmuxError {
     /// 序列化/反序列化错误（协议层）。
     #[error("序列化错误: {message}")]
     SerializationError { message: String },
+
+    /// op 被识别但此 daemon 构建不支持（M2a：Subscribe/Attach 等分阶段到 M2b；
+    /// 或客户端比 daemon 新、请求了未实现的操作）。区别于 `SerializationError`
+    /// （后者是 wire 解析失败，前者是语义上能解析但 daemon 无对应实现）。
+    #[error("不支持的操作: {message}")]
+    Unsupported { message: String },
+
+    /// 资源临时不可用，请稍后重试（M2b：attach 限速 / per-pane 并发快照=1 的排队拒绝，D-7）。
+    #[error("资源繁忙: {message}")]
+    Busy { message: String },
 }
 
 #[cfg(test)]

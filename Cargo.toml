@@ -13,11 +13,19 @@ categories = ["command-line-utilities", "os::windows-apis"]
 [lib]
 name = "conmux"
 
+# 单二进制多子命令（M2 设计 D-2）：`conmux daemon` 跑 daemon，其余为瘦客户端。
+# 手搓 arg 解析——不引 clap，保持 conflux 嵌入 conmux 时的依赖树精简。
+[[bin]]
+name = "conmux"
+path = "src/bin/conmux.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-# capture() 的 CaptureResult.data_base64 编码（cutover 2b-3b）。
+# capture() 的 CaptureResult.data_base64 编码（cutover 2b-3b）+ MuxNotify.data wire base64（M2a）。
 base64 = "0.22"
+# wire 帧编码（M2a，D-4 长度前缀 JSON）——自 dev 提升为生产依赖。
+serde_json = "1"
 # 后续增量：tokio（按需）
 
 # cutover 2b（MF-4 JobObject + ConPTY 后端）。windows-sys（非整 windows crate，体积
@@ -25,13 +33,17 @@ base64 = "0.22"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
-    "Win32_Security",         # CreateJobObjectW 的 SECURITY_ATTRIBUTES 参数需要
+    "Win32_Security",              # SECURITY_ATTRIBUTES / token 查询（JobObject + pipe DACL）
+    "Win32_Security_Authorization", # M2a：ConvertSid/SecurityDescriptor（pipe DACL，I-1）
     "Win32_System_JobObjects",
     "Win32_System_Threading",
+    "Win32_System_Pipes",          # M2a：命名管道服务端/客户端（I-1..I-5）
+    "Win32_System_IO",             # M2a：ConnectNamedPipe/ReadFile/WriteFile 的 OVERLAPPED 形参
+    "Win32_Storage_FileSystem",    # M2a：CreateFileW/ReadFile/WriteFile + FIRST_PIPE_INSTANCE + PIPE_ACCESS_DUPLEX
+    "Win32_System_Console",        # M2b：CLI attach raw console（GetStdHandle/Get|SetConsoleMode + VT 模式）
 ] }
 # 2b-2 起为生产依赖（WindowsPaneSession）。0.9 无条件设 INHERIT_CURSOR → 读线程必须
 # 应答 DSR ESC[6n，否则启动阻塞（spike research/conpty-spike-2026-06-11 实证）。
 portable-pty = "0.9"
 
-[dev-dependencies]
-serde_json = "1"
+# serde_json 已在生产依赖（wire），dev 无需重复声明。
