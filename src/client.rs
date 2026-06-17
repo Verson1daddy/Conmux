@@ -46,6 +46,13 @@ impl Client {
         Self::connect_named(name, false)
     }
 
+    /// 设控制连接读超时（防 wedged-but-alive daemon 下 `request` 无限阻塞持锁，红队 SF-1）。
+    /// `None`=无限等（默认）。设后 `request` 在 daemon 不应答超时后返 `TimedOut` Err，调用方
+    /// 应视该连接为不可信（可能 desync）并丢弃重连。不影响 attach 流式读半。
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.stream.set_read_timeout(timeout);
+    }
+
     fn connect_named(name: &str, allow_spawn: bool) -> Result<Self, ConmuxError> {
         match try_connect(name, 1000)? {
             ConnectOutcome::Connected(s) => return Self::handshake(s),

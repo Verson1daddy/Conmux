@@ -14,6 +14,7 @@
 use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::iter::once;
+use std::time::Duration;
 
 use crate::ConmuxError;
 
@@ -21,7 +22,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE,
     ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING,
     ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -41,9 +42,9 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 const PIPE_PREFIX: &str = r"\\.\pipe\conmux.";
 const PIPE_BUF_SIZE: u32 = 64 * 1024;
@@ -150,8 +151,20 @@ impl Drop for IoEvent {
     }
 }
 
-/// 重叠读：发起 ReadFile(OVERLAPPED) → GetOverlappedResult(bWait) 等完成。对端关闭 ⇒ `Ok(0)`。
-fn overlapped_read(handle: HANDLE, event: HANDLE, buf: &mut [u8]) -> io::Result<usize> {
+/// 重叠读：发起 ReadFile(OVERLAPPED) → 等完成。对端关闭 ⇒ `Ok(0)`。
+///
+/// `timeout_ms`：
+/// - `None`（默认，流式 reader）：`GetOverlappedResult(bWait=1)` 无限等——长驻 pane 输出
+///   稀疏，读半必须无限等否则会把"暂时没输出"误判为错误。
+/// - `Some(ms)`（控制连接请求-应答）：仍 pending 时 `WaitForSingleObject(event, ms)` 限时等；
+///   超时则 `CancelIoEx` 取消本次读 + 排空被取消操作，返回 `TimedOut`——防 wedged daemon
+///   下控制请求无限阻塞持锁（红队 SF-1）。只作用于 `PipeStream`，不波及 `PipeReader`（流式）。
+fn overlapped_read(
+    handle: HANDLE,
+    event: HANDLE,
+    buf: &mut [u8],
+    timeout_ms: Option<u32>,
+) -> io::Result<usize> {
     if buf.is_empty() {
         return Ok(0);
     }
@@ -167,14 +180,43 @@ fn overlapped_read(handle: HANDLE, event: HANDLE, buf: &mut [u8]) -> io::Result<
             &mut ov,
         )
     };
+    let mut pending = false;
     if ok == 0 {
         let err = unsafe { GetLastError() };
-        if err != ERROR_IO_PENDING {
+        if err == ERROR_IO_PENDING {
+            pending = true;
+        } else {
             return map_read_err(err);
         }
     }
+    // 限时模式且仍在途：限时等事件，未 signaled（超时或 WAIT_FAILED）则取消本次 I/O。
+    if pending {
+        if let Some(ms) = timeout_ms {
+            // SAFETY: event 为本流手动复位事件，ReadFile 完成时由内核置信号。
+            let wait = unsafe { WaitForSingleObject(event, ms) };
+            if wait != WAIT_OBJECT_0 {
+                // 超时 / WAIT_FAILED 一律：先 CancelIoEx 取消在途读，再 bWait=1 排空——确保本帧
+                // 返回前 ov/event 已无在途 I/O 引用（LOW-2：闭合 WAIT_FAILED 分支的生命周期洞）。
+                // SAFETY: 取消本句柄上以 &ov 标识的在途读；GetOverlappedResult bWait=1 必返
+                // （取消的 op 很快以 ABORTED 完成，或它其实已真完成）。
+                unsafe { CancelIoEx(handle, &ov) };
+                let mut drained: u32 = 0;
+                let r = unsafe { GetOverlappedResult(handle, &ov, &mut drained, 1) };
+                // SF-1 竞态：读在 cancel 前已真完成 → drained 字节已落 buf，按成功返还（不丢已到帧）。
+                if r != 0 && drained > 0 {
+                    return Ok(drained as usize);
+                }
+                if wait == WAIT_TIMEOUT {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "命名管道读超时"));
+                }
+                // WAIT_FAILED 等（near-impossible）：已取消排空，返错。
+                return map_read_err(unsafe { GetLastError() });
+            }
+            // WAIT_OBJECT_0：已 signaled → 落到下面 bWait=1（已完成，立即返回）取字节。
+        }
+    }
     let mut got: u32 = 0;
-    // bWait=TRUE：等本操作完成（经 ov.hEvent，不串行化其它方向操作）。
+    // bWait=TRUE：等本操作完成（经 ov.hEvent，不串行化其它方向操作）。已完成则立即返回。
     let r = unsafe { GetOverlappedResult(handle, &ov, &mut got, 1) };
     if r != 0 {
         Ok(got as usize)
@@ -228,6 +270,8 @@ fn overlapped_write(handle: HANDLE, event: HANDLE, buf: &[u8]) -> io::Result<usi
 pub struct PipeStream {
     inner: std::sync::Arc<PipeHandle>,
     ev: IoEvent,
+    /// 读超时（None=无限等，默认）。仅控制连接（请求-应答）设；流式 reader（attach）不设。
+    read_timeout_ms: Option<u32>,
 }
 
 impl PipeStream {
@@ -235,7 +279,21 @@ impl PipeStream {
         Ok(Self {
             inner: std::sync::Arc::new(PipeHandle { handle }),
             ev: IoEvent::new()?,
+            read_timeout_ms: None,
         })
+    }
+
+    /// 设读超时（控制连接用，防 wedged daemon 下请求无限阻塞持锁）。`None`=恢复无限等。
+    /// `Duration` 截断为毫秒（饱和到 `u32::MAX`）。不影响写、不影响已 `split` 出的流式读半。
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout_ms = timeout.map(|d| {
+            let ms = d.as_millis();
+            if ms > u32::MAX as u128 {
+                u32::MAX
+            } else {
+                ms as u32
+            }
+        });
     }
 
     /// 取客户端进程 id（I-5：身份不可得 ⇒ None，调用方 fail-closed 断连）。
@@ -280,7 +338,7 @@ impl PipeStream {
 
 impl Read for PipeStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        overlapped_read(self.inner.handle, self.ev.event, buf)
+        overlapped_read(self.inner.handle, self.ev.event, buf, self.read_timeout_ms)
     }
 }
 impl Write for PipeStream {
@@ -299,7 +357,8 @@ pub struct PipeReader {
 }
 impl Read for PipeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        overlapped_read(self.inner.handle, self.ev.event, buf)
+        // 流式读半永远无限等（长驻 pane 输出稀疏；不可把"暂无输出"当超时）。
+        overlapped_read(self.inner.handle, self.ev.event, buf, None)
     }
 }
 
@@ -628,6 +687,62 @@ mod tests {
             ConnectOutcome::NoDaemon => {}
             ConnectOutcome::Connected(_) => panic!("不应连上不存在的 daemon"),
         }
+    }
+
+    /// 读超时（SF-1）：服务端延迟写 → 客户端短超时首读返 TimedOut；之后流仍可读到数据
+    /// （证 CancelIoEx 未弄坏句柄）。
+    #[test]
+    fn read_timeout_returns_timedout_then_stream_recovers() {
+        let name = r"\\.\pipe\conmux-test-read-timeout";
+        let mut listener = PipeListener::bind(name).expect("bind 应成功");
+
+        let server = std::thread::spawn(move || {
+            let mut s = listener.accept().expect("accept 应成功");
+            // 故意延迟 400ms 才写——制造客户端首读超时。
+            std::thread::sleep(Duration::from_millis(400));
+            s.write_all(b"late!").expect("server 写");
+            s.flush().ok();
+            // 保活到客户端读完。
+            let mut tail = [0u8; 1];
+            let _ = s.read(&mut tail);
+        });
+
+        let mut client = loop {
+            match try_connect(name, 500).expect("try_connect") {
+                ConnectOutcome::Connected(s) => break s,
+                ConnectOutcome::NoDaemon => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+
+        // 首读：120ms 超时，服务端 400ms 才写 → 应 TimedOut 且在超时附近返回（非无限阻塞）。
+        client.set_read_timeout(Some(Duration::from_millis(120)));
+        let mut buf = [0u8; 5];
+        let started = std::time::Instant::now();
+        let r = client.read(&mut buf);
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&r, Err(e) if e.kind() == io::ErrorKind::TimedOut),
+            "首读应 TimedOut，实际 {r:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "应在超时附近返回（非无限阻塞），实际 {elapsed:?}"
+        );
+
+        // 恢复：放宽超时，流仍可读到服务端后续写出的数据（CancelIoEx 未弄坏句柄）。
+        client.set_read_timeout(Some(Duration::from_millis(2000)));
+        let mut got = Vec::new();
+        let mut tmp = [0u8; 8];
+        while got.len() < 5 {
+            match client.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&tmp[..n]),
+                Err(e) => panic!("恢复读失败: {e:?}"),
+            }
+        }
+        assert_eq!(&got, b"late!", "取消后流应仍能读到后续数据");
+        drop(client);
+        server.join().unwrap();
     }
 
     /// SID 字符串派生可用，默认管道名含前缀。
