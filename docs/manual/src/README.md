@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./logo-dark.svg">
+    <img alt="conmux" src="./logo-light.svg" width="84">
+  </picture>
+</p>
+
 # Conmux 手册
 
 Conmux 是一个**为 Windows 而生的类 tmux 中间件**：把任意 CLI —— 原生程序、PowerShell、乃至 WSL 里的工具 —— 接成同一套受监管的会话。它的目标很朴素：让 agent CLI 在 Windows 上**跑得起来、看得住**，又不用背上一整个 IDE。
