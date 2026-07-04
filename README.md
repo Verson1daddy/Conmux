@@ -2,6 +2,8 @@
 
 **A Windows-native terminal multiplexer: let your PowerShell, WSL and AI agents live in one supervised session.**
 
+📖 **User manual / 用户手册**: <https://verson1daddy.github.io/Conmux/> — tiered guides (first time / coming from tmux / control plane / for agent-CLI authors).
+
 conmux is an independent product, not an internal component. It is the terminal foundation that [Conflux](https://github.com/Verson1daddy/Conflux) (a multi-agent CLI workbench) is built on — but it stands on its own: if you download conmux you get a terminal multiplexer, nothing else.
 
 > **Status: early development (v0.1.x).** The mechanism-layer Rust library already powers Conflux in production use: real ConPTY panes, whole-tree process supervision, a single audited input path, scrollback/capture, themes, and a frozen wire-protocol type layer. On top of it, the **standalone daemon now exists** — named-pipe IPC, detach/attach with seamless VT replay, per-connection audit, backpressure — so *close the client, the pane keeps running; reattach and the screen is intact*. Backed by 110+ tests including real-pipe + real-process integration tests. The native GUI shell and cross-WSL session unification are the active roadmap. Interactive CLI `attach` keystroke handling is implemented but still gets manual-terminal verification before being called done. APIs outside the protocol layer are unstable.
