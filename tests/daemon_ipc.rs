@@ -42,11 +42,28 @@ fn connect_retry(name: &str) -> Client {
     }
 }
 
+/// Slice 1：内核 spawn 守卫要求绝对路径。集成测试用 SystemRoot 把裸系统 exe 名拼成
+/// 绝对路径（cmd.exe / powershell.exe），与 src/pane.rs windows_e2e 的
+/// system_cmd / system_powershell 同源。已是绝对路径则原样返回。
+fn system_exe(program: &str) -> String {
+    use std::path::Path;
+    if Path::new(program).is_absolute() {
+        return program.to_string();
+    }
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    let base = Path::new(&root).join("System32");
+    let resolved = match program.to_ascii_lowercase().as_str() {
+        "powershell.exe" | "powershell" => base.join("WindowsPowerShell\\v1.0\\powershell.exe"),
+        other => base.join(other),
+    };
+    resolved.to_string_lossy().into_owned()
+}
+
 fn spawn_req(pane_id: &str, program: &str, args: &[&str]) -> SpawnRequest {
     SpawnRequest {
         pane_id: PaneId(pane_id.into()),
         command: CommandSpec {
-            program: program.into(),
+            program: system_exe(program),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: None,
             env: Vec::new(),
@@ -342,7 +359,7 @@ fn completion_criteria_kill_client_pane_survives_reattach_intact() {
     let req = SpawnRequest {
         pane_id: PaneId(pane.into()),
         command: CommandSpec {
-            program: "powershell.exe".into(),
+            program: system_exe("powershell.exe"),
             args: vec![
                 "-NoProfile".into(),
                 "-Command".into(),

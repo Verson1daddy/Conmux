@@ -1,0 +1,12 @@
+[book]
+title = "Conmux 手册"
+authors = ["稻穗"]
+language = "zh"
+src = "src"
+description = "让 agent CLI 在 Windows 上跑得起来、看得住的中间件 —— 分级上手手册"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/Verson1daddy/Conmux"
+edit-url-template = "https://github.com/Verson1daddy/Conmux/edit/main/docs/manual/{path}"

@@ -41,7 +41,6 @@
 pub mod error;
 /// 机制层类型：PaneId / PaneSize / PaneLifecycle / InjectionSource / PaneState 等（契约 §1/§8）。
 pub mod types;
-
 /// scrollback：行索引环形缓冲（契约 §5）。`pub(crate)` 内部——
 /// 对外只经 capture / `PaneState.scrollback` 暴露语义化结果，不暴露缓冲本体。
 pub(crate) mod scrollback;
@@ -102,6 +101,10 @@ pub mod client;
 /// 唯一属主，conflux 与未来独立 CLI 共享。
 pub mod theme;
 
+/// 信任校验（Slice 2 · 安全本体）：WinVerifyTrust Authenticode 验签 + 无签名哈希钉 TOFU
+/// + fail-closed 决策。注入 `PaneHost`（参照 hooks/event_sink 模式）。
+pub mod trust;
+
 // ===== 公开 API 重导出（顶层可达）=====
 pub use capture::{CaptureRange, CaptureRequest, CaptureResult};
 pub use error::ConmuxError;
@@ -117,4 +120,5 @@ pub use wire::{read_frame, write_frame, WireError, MAX_FRAME_BYTES};
 pub use theme::{builtin_terminal_themes, TerminalTheme, ThemeAppearance, DEFAULT_TERMINAL_THEME_ID};
 // M③ Style 注册表（chrome 语义 token + 配对终端预置；TerminalTheme 结构未动）。
 pub use theme::{builtin_styles, ChromeTokens, Style, DEFAULT_STYLE_ID};
+pub use trust::{PinnedTarget, SharedTrustStore, TrustDecision, TrustMode, TrustPolicy, TrustStore};
 pub use types::{InjectionSource, PaneId, PaneLifecycle, PaneSize, PaneState, ScrollbackInfo};

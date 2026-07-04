@@ -1,6 +1,6 @@
 [package]
 name = "conmux"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.77"
 description = "Windows-native terminal multiplexer: PowerShell, WSL and AI agents in one supervised session (mechanism layer)"
@@ -35,6 +35,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",              # SECURITY_ATTRIBUTES / token 查询（JobObject + pipe DACL）
     "Win32_Security_Authorization", # M2a：ConvertSid/SecurityDescriptor（pipe DACL，I-1）
+    "Win32_Security_WinTrust",     # Slice 2：WinVerifyTrust Authenticode 验签 + WTHelper 链
+    "Win32_Security_Cryptography", # Slice 2：CertGetNameStringW 取签名主体 + 证书上下文释放
+    "Win32_Security_Cryptography_Catalog", # Slice 2：WTHelperProvDataFromStateData / WTHelperGetProvSignerFromChain 依赖 CRYPT_PROVIDER_DATA
+    "Win32_Security_Cryptography_Sip",     # Slice 2：同上（CRYPT_PROVIDER_DATA 需 Catalog + Sip 双 feature）
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_Pipes",          # M2a：命名管道服务端/客户端（I-1..I-5）
@@ -45,5 +49,12 @@ windows-sys = { version = "0.59", features = [
 # 2b-2 起为生产依赖（WindowsPaneSession）。0.9 无条件设 INHERIT_CURSOR → 读线程必须
 # 应答 DSR ESC[6n，否则启动阻塞（spike research/conpty-spike-2026-06-11 实证）。
 portable-pty = "0.9"
+
+# Slice 2 验签：trust.toml 读写。
+# 常规依赖（非 target-specific）——纯决策逻辑 + TrustStore 序列化跨平台可测，
+# FFI 部分（WinVerifyTrust）单独 cfg(windows)。
+# 注：sha2 不用 crate（其依赖 generic-array 的 build script 在沙箱里 spawn rustc 失败），
+# 改用 trust.rs 内手写纯 Rust SHA-256（FIPS 180-4，零依赖）。
+toml = "0.8"
 
 # serde_json 已在生产依赖（wire），dev 无需重复声明。

@@ -2,9 +2,12 @@
 
 独立版本线（设计稿 §6）。承诺面（见 lib.rs Stability 节）的任何变更必须在此登记并伴随 minor bump；patch 不得破坏承诺面。
 
-## [Unreleased]
+## [0.1.1] — 2026-07-04
 
 ### Added
+- **命名管道读超时 + unpin 对称化**（发布准备收口）：
+  - **控制客户端读超时**：`client.request()` 阻塞读加限时（重叠 I/O `WaitForSingleObject` + 超时 `CancelIoEx` + 排空），wedged-but-alive daemon 下心跳不再无限持 control 锁；`PipeReader`（attach 流式）仍传 `None` 永无限等（长驻 pane 输出稀疏，不可误判超时）。
+  - **`UnpinExecutable` IPC op**（+ `MuxPayload::Unpinned`）：与 `PinExecutable` 对称——daemon 经同一 `SharedTrustStore` Arc 即时改内存态 + 存盘（原 unpin 只直写文件，运行中 daemon 重启前不生效，收权慢于授权）。加法性变体，不 bump `PROTOCOL_VERSION`（沿 `PinExecutable` 先例）。
 - **M2c 收口**（"关窗不死"完成判据达成）：
   - **theme 广播**：SetTheme 校验 id → 向全部连接广播 `MuxNotify::ThemeChanged`（全局，daemon 不持久化）；CLI `theme ls/set`。
   - **连接审计落盘**（D-2/RT-2）：`%LOCALAPPDATA%\conmux\daemon.log`（滚动 1MiB，fail-soft，无遥测）记 connect/disconnect{pid, image_path, reason, outcome}。

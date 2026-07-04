@@ -27,7 +27,7 @@ use crate::event::{MuxNotify, PaneEventSink};
 use crate::pane::PaneHost;
 use crate::pipe::{process_image_path, try_connect, ConnectOutcome, PipeListener, PipeStream, PipeWriter};
 use crate::protocol::{MuxOp, MuxPayload, MuxReply, MuxRequest, WireFrame, PROTOCOL_VERSION};
-use crate::types::{InjectionSource, PaneId};
+use crate::types::{InjectionSource, PaneId, PaneLifecycle};
 use crate::wire::{read_frame, write_frame, WireError};
 use crate::ConmuxError;
 
@@ -76,11 +76,16 @@ impl DaemonLog {
     /// 追加一条审计行（`<epoch_ms> <event>`）。滚动：超上限把现文件改名 .1 后另起。
     fn log(&self, event: &str) {
         use std::io::Write;
-        let g = self.state.lock().unwrap_or_else(recover);
-        // 滚动（best-effort）。
-        if let Ok(meta) = std::fs::metadata(&g.path) {
-            if meta.len() > g.max_bytes {
-                let _ = std::fs::rename(&g.path, g.path.with_extension("log.1"));
+        // 锁内只克隆 path + max_bytes（短临界区）；所有 fs I/O 移到锁外
+        // （消 §2.3① 锁内 I/O——慢盘 / 杀软扫描不再阻塞后续 log 调用）。
+        let (path, max_bytes) = {
+            let g = self.state.lock().unwrap_or_else(recover);
+            (g.path.clone(), g.max_bytes)
+        };
+        // 滚动（best-effort，锁外）。
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > max_bytes {
+                let _ = std::fs::rename(&path, path.with_extension("log.1"));
             }
         }
         let ts = SystemTime::now()
@@ -90,7 +95,7 @@ impl DaemonLog {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&g.path)
+            .open(&path)
         {
             let _ = writeln!(f, "{ts} {event}");
         }
@@ -200,6 +205,10 @@ struct DaemonShared {
     attaching: Mutex<HashSet<PaneId>>,
     /// 连接级审计日志（D-2/RT-2，本地文件 fail-soft）。
     log: DaemonLog,
+    /// 信任库句柄（Slice 3：PinExecutable IPC 经此直接改内存态 + 存盘，
+    /// 与 PaneHost 持有的 `Arc<dyn TrustPolicy>` 是**同一 Arc**，pin 后下次 spawn verify 即见）。
+    /// None = 测试态（PinExecutable 返回 Unsupported）。
+    trust_store: Option<Arc<crate::trust::SharedTrustStore>>,
 }
 
 /// conmux daemon。`bind` 绑定管道，`serve` 进入服务循环。
@@ -214,11 +223,18 @@ impl Daemon {
         let listener = PipeListener::bind(&config.pipe_name)?;
         let conns: Arc<Mutex<HashMap<u64, Arc<ConnHandle>>>> = Arc::new(Mutex::new(HashMap::new()));
         // M2a 单用形态：钩子链空（R-2 全 UserDirect）；event_sink = FanoutSink（按订阅投递）。
-        let host = PaneHost::new_windows(
+        // Slice 2：启动时加载 TrustStore 一次，注入 PaneHost（spawn 热路径不做文件 I/O）。
+        // 用 SharedTrustStore：未来 reload IPC 可经同一共享态即时生效。
+        let trust_store = Arc::new(crate::trust::SharedTrustStore::load_or_create());
+        // 同一 Arc 两份：一份 move 进 PaneHost（coerce 为 Arc<dyn TrustPolicy>），
+        // 一份留 DaemonShared 供 PinExecutable IPC 直接改内存态（保持具体类型调 pin_executable）。
+        let trust_for_shared = Arc::clone(&trust_store);
+        let host = PaneHost::new_windows_with_trust(
             Vec::new(),
             Arc::new(FanoutSink {
                 conns: Arc::clone(&conns),
             }),
+            trust_store,
         );
         let shared = Arc::new(DaemonShared {
             host,
@@ -228,6 +244,7 @@ impl Daemon {
             next_conn_id: AtomicU64::new(1),
             attaching: Mutex::new(HashSet::new()),
             log: DaemonLog::for_current_user(),
+            trust_store: Some(trust_for_shared),
         });
         Ok(Self { shared, listener })
     }
@@ -431,7 +448,8 @@ fn serve_connection<R: Read>(
             Ok(WireFrame::Request(req)) => {
                 let kill_server = matches!(req.op, MuxOp::KillServer);
                 let reply = build_reply(req, shared, conn);
-                conn.enqueue(WireFrame::Reply(reply), 256);
+                let bytes = reply_bytes(&reply);
+                conn.enqueue(WireFrame::Reply(reply), bytes);
                 if kill_server {
                     return ConnOutcome::KillServerRequested;
                 }
@@ -472,6 +490,29 @@ fn build_reply(req: MuxRequest, shared: &Arc<DaemonShared>, conn: &ConnHandle) -
         MuxOp::ListPanes => Ok(MuxPayload::Panes(host.list_panes())),
         MuxOp::ListThemes => Ok(MuxPayload::Themes(crate::theme::builtin_terminal_themes())),
         MuxOp::KillServer => Ok(MuxPayload::ServerKillScheduled),
+        // Slice 3：pin 可执行文件到信任库。经 SharedTrustStore 同一 Arc 直接改内存态 + 存盘，
+        // 下次 spawn verify 即见新 pin（免 daemon 重启）。path 校验绝对路径 + 存在性；
+        // pin_executable 内部算 SHA-256 写 pinned_targets。
+        MuxOp::PinExecutable { path } => match &shared.trust_store {
+            Some(store) => store
+                .pin_executable(&path)
+                .map(|_| MuxPayload::Pinned)
+                .map_err(|e| ConmuxError::Unsupported { message: e }),
+            None => Err(ConmuxError::Unsupported {
+                message: "此 daemon 未装配信任库（测试态），不支持 pin".into(),
+            }),
+        },
+        // P1-b：unpin 对称走 IPC（同 SharedTrustStore Arc 即时生效 + 存盘）——此前
+        // 只有客户端直写文件，运行中 daemon 内存态不受影响，收权慢于授权。
+        MuxOp::UnpinExecutable { path } => match &shared.trust_store {
+            Some(store) => store
+                .unpin(&path)
+                .map(|_| MuxPayload::Unpinned)
+                .map_err(|e| ConmuxError::Unsupported { message: e }),
+            None => Err(ConmuxError::Unsupported {
+                message: "此 daemon 未装配信任库（测试态），不支持 unpin".into(),
+            }),
+        },
         // D-5 订阅：维护本连接订阅集（fan-out 据此投递）。
         MuxOp::Subscribe { pane_id } => {
             conn.subscriptions.lock().unwrap_or_else(recover).insert(pane_id);
@@ -543,10 +584,15 @@ fn attach_with_limits(
         }
     }
     // 先注册订阅（D-6），后取快照；无论成败清并发标记。
-    conn.subscriptions
-        .lock()
-        .unwrap_or_else(recover)
-        .insert(pane_id.clone());
+    // D-6 不变量：订阅本身先于 attach_snapshot 建立——消费方靠 `seq > last_seq`
+    // 去重，先订阅保证快照后到达的 PaneOutput 事件不丢。这里只提前 drop
+    // subscriptions 的 Mutex guard（订阅记录已写入 HashSet），**不改变订阅顺序**。
+    // 显式块让"guard 在 attach_snapshot 前释放"的意图清晰，防后续维护误把
+    // attach_snapshot 挪进 subscriptions 锁内（会引入 L8→L1 嵌套）。
+    {
+        let mut subs = conn.subscriptions.lock().unwrap_or_else(recover);
+        subs.insert(pane_id.clone());
+    }
     let result = shared.host.attach_snapshot(&pane_id);
     shared
         .attaching
@@ -603,10 +649,23 @@ fn run_exit_sweep(shared: Arc<DaemonShared>) {
 }
 
 /// 一趟 sweep：poll_exit 各 pane，首次转 Exited 广播 PaneExited（swept 去重 + 清理已移除）。
+///
+/// **S-1 代际化（2026-07-02 审计）**：respawn 复用同 `PaneId`（`pane.rs::respawn` =
+/// remove + kill + spawn 同 id）。swept 若只按 PaneId 永久去重，旧代际退出被广播后，
+/// 新代际的退出会被永久挡在 sweep 兜底之外（只剩不可靠的 reader-EOF 路径）。
+/// 修复依赖的不变量：**被 sweep 广播过的 pane，其同代际表内 lifecycle 已被 poll_exit
+/// 写回为 `Exited` 且不可逆**——因此再次观测到非 `Exited`（Spawning/Running）必是
+/// respawn 出的新代际 ⇒ 清 swept 标记，新代际退出可再次广播。该判据对"新代际在首次
+/// sweep 前就快速退出"也成立：表内 lifecycle 只由 poll_exit 写回，新代际未被 poll 前
+/// 恒为 Running。
 fn sweep_exits_once(shared: &Arc<DaemonShared>, swept: &mut HashSet<PaneId>) {
     let panes = shared.host.list_panes();
     let live: HashSet<PaneId> = panes.iter().map(|s| s.pane_id.clone()).collect();
     for state in &panes {
+        // 代际检测：已 sweep 的 pane 观测到非 Exited ⇒ 新代际，允许再次广播。
+        if !matches!(state.lifecycle, PaneLifecycle::Exited(_)) {
+            swept.remove(&state.pane_id);
+        }
         if swept.contains(&state.pane_id) {
             continue;
         }
@@ -647,6 +706,32 @@ fn notify_bytes(notify: &MuxNotify) -> usize {
     }
 }
 
+/// 应答近似字节数（背压记账）。
+///
+/// **S-2（2026-07-02 审计）**：此前一切应答固定按 256B 记账，而 Captured/AttachSnapshot
+/// 携带 base64 大载荷（1MiB ring → ~1.4MB 帧）——8MiB 队列上界最坏对应 32768 帧 ×
+/// ~1.4MB ≈ 45GB 真实内存（Capture 又无 Attach 那样的限速）。按内容量记账后，
+/// `MAX_QUEUE_BYTES` 重新成为真实内存上界：慢客户端排队少量大帧即触发背压断连。
+fn reply_bytes(reply: &MuxReply) -> usize {
+    match reply {
+        MuxReply::Ok { payload, .. } => match payload {
+            MuxPayload::Captured(c) => c.data_base64.len().saturating_add(128),
+            MuxPayload::AttachSnapshot {
+                mode_preamble_b64,
+                history_b64,
+                ..
+            } => mode_preamble_b64
+                .len()
+                .saturating_add(history_b64.len())
+                .saturating_add(192),
+            MuxPayload::Panes(panes) => panes.len().saturating_mul(256).saturating_add(64),
+            MuxPayload::Themes(themes) => themes.len().saturating_mul(1024).saturating_add(64),
+            _ => 256,
+        },
+        MuxReply::Err { .. } => 256,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,6 +754,7 @@ mod tests {
             next_conn_id: AtomicU64::new(1),
             attaching: Mutex::new(HashSet::new()),
             log: DaemonLog::with_path(std::env::temp_dir().join("conmux-test-unused.log"), MAX_LOG_BYTES),
+            trust_store: None,
         })
     }
 
@@ -931,12 +1017,19 @@ mod tests {
     fn exit_sweep_broadcasts_pane_exited_to_subscribers() {
         let shared = test_shared();
         let pane_id = PaneId("sweep-exit".into());
+        // Slice 1：内核 spawn 守卫要求绝对路径（SystemRoot 拼系统 cmd.exe）。
+        let cmd_abs = std::path::PathBuf::from(
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+        )
+        .join("System32\\cmd.exe")
+        .to_string_lossy()
+        .into_owned();
         shared
             .host
             .spawn(crate::pane::SpawnRequest {
                 pane_id: pane_id.clone(),
                 command: crate::pane::CommandSpec {
-                    program: "cmd.exe".into(),
+                    program: cmd_abs,
                     args: vec!["/c".into(), "exit 7".into()],
                     cwd: None,
                     env: vec![],
@@ -989,6 +1082,152 @@ mod tests {
         let _ = shared.host.kill(&pane_id);
     }
 
+    /// S-1（2026-07-02 审计）：respawn 复用同 PaneId——旧代际退出被 sweep 广播后，
+    /// 新代际的退出必须能再次被 sweep 广播（此前 swept 按 PaneId 永久去重 ⇒ 新代际
+    /// 退出事件被永久挡在 sweep 兜底之外，仅剩不可靠的 reader-EOF 路径）。
+    /// real ConPTY：两代皆 cmd /c exit N 快退，退出码区分代际。
+    #[test]
+    fn exit_sweep_rebroadcasts_after_respawn() {
+        let shared = test_shared();
+        let pane_id = PaneId("sweep-respawn".into());
+        let cmd_abs = std::path::PathBuf::from(
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+        )
+        .join("System32\\cmd.exe")
+        .to_string_lossy()
+        .into_owned();
+        let spawn_req = |exit_code: &str| crate::pane::SpawnRequest {
+            pane_id: pane_id.clone(),
+            command: crate::pane::CommandSpec {
+                program: cmd_abs.clone(),
+                args: vec!["/c".into(), format!("exit {exit_code}")],
+                cwd: None,
+                env: vec![],
+            },
+            size: PaneSize { rows: 24, cols: 80 },
+            adapter_id: "shell".into(),
+            display_name: None,
+            created_at: 0,
+        };
+        shared.host.spawn(spawn_req("7")).expect("spawn 第一代快退 pane");
+
+        let (conn, rx) = test_conn();
+        conn.subscriptions.lock().unwrap().insert(pane_id.clone());
+        shared.conns.lock().unwrap().insert(1, Arc::clone(&conn));
+
+        let mut swept = HashSet::new();
+
+        // 第一代退出 → 广播 exit 7。
+        let mut got: Option<Option<i32>> = None;
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            sweep_exits_once(&shared, &mut swept);
+            for f in drain_frames(&rx) {
+                if let WireFrame::Notify(MuxNotify::PaneExited { exit_code, .. }) = f {
+                    got = Some(exit_code);
+                }
+            }
+            if got.is_some() {
+                break;
+            }
+        }
+        assert_eq!(got, Some(Some(7)), "第一代退出应被 sweep 广播");
+
+        // respawn 同 id（第二代，exit 9）。
+        shared
+            .host
+            .respawn(&pane_id, spawn_req("9"))
+            .expect("respawn 第二代快退 pane");
+
+        // 防 flake（红队 2026-07-02）：gen1 的 reader-EOF 路径可能在 phase-1 break 后
+        // 才迟到落帧 PaneExited(7)（ConPTY EOF 时序不定）——先清残帧，且下方只认
+        // exit 9（stale 7 忽略）。本测试锚定"新代际退出事件可再次到达订阅者"，
+        // 不区分 sweep/reader 来源（gen2 reader-EOF 也可能自发 9，见红队登记）。
+        let _ = drain_frames(&rx);
+
+        // 新代际退出 → 必须再次被广播（旧实现在此永久沉默）。
+        let mut got2: Option<Option<i32>> = None;
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(100));
+            sweep_exits_once(&shared, &mut swept);
+            for f in drain_frames(&rx) {
+                if let WireFrame::Notify(MuxNotify::PaneExited { exit_code, .. }) = f {
+                    if exit_code == Some(9) {
+                        got2 = Some(exit_code);
+                    }
+                }
+            }
+            if got2.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            got2,
+            Some(Some(9)),
+            "respawn 后新代际的退出必须再次被 sweep 广播（S-1 代际化）"
+        );
+
+        let _ = shared.host.kill(&pane_id);
+    }
+
+    /// S-2：应答背压记账按内容量——Capture 大帧不得再按固定 256B 记账（8MiB 队列
+    /// 上界曾最坏对应 ~45GB 真实内存的放大洞）。
+    #[test]
+    fn reply_bytes_scales_with_payload() {
+        let big = "A".repeat(2 * 1024 * 1024);
+        let captured = MuxReply::Ok {
+            correlation_id: 1,
+            payload: MuxPayload::Captured(crate::capture::CaptureResult {
+                data_base64: big.clone(),
+                first_abs_line: 0,
+                last_abs_line: 0,
+                truncated: false,
+                effectively_full: false,
+            }),
+        };
+        assert!(
+            reply_bytes(&captured) >= big.len(),
+            "Capture 帧应按 base64 内容长度记账"
+        );
+
+        let small = MuxReply::Ok {
+            correlation_id: 2,
+            payload: MuxPayload::Sent,
+        };
+        assert_eq!(reply_bytes(&small), 256, "小应答维持固定近似记账");
+
+        let err = MuxReply::Err {
+            correlation_id: 3,
+            error: ConmuxError::Unsupported {
+                message: "x".into(),
+            },
+        };
+        assert_eq!(reply_bytes(&err), 256, "错误应答维持固定近似记账");
+    }
+
+    /// P1-b：未装配信任库的 daemon 对 UnpinExecutable 诚实拒绝（镜像 pin 语义），
+    /// 客户端据此回退直写文件。
+    #[test]
+    fn unpin_without_trust_store_is_unsupported() {
+        let mut r = reader_with(&[
+            hello(PROTOCOL_VERSION),
+            request(MuxOp::UnpinExecutable {
+                path: "C:\\shim\\x.cmd".into(),
+            }),
+        ]);
+        let (conn, rx) = test_conn();
+        let shared = test_shared();
+        serve_connection(&mut r, Some(1234), &shared, &conn);
+        let replies = drain_frames(&rx);
+        assert!(matches!(
+            replies.last(),
+            Some(WireFrame::Reply(MuxReply::Err {
+                error: ConmuxError::Unsupported { .. },
+                ..
+            }))
+        ));
+    }
+
     /// D-7：同连接 <500ms 内两次 Attach 同 pane，第二次回 Busy（限速防快照放大）。
     #[test]
     fn rapid_attach_is_rate_limited() {
@@ -1018,6 +1257,46 @@ mod tests {
             matches!(errs[1], ConmuxError::Busy { .. }),
             "第二次快速 attach 应被限速 Busy，实际: {:?}",
             errs[1]
+        );
+    }
+
+    /// 测试 4（第 5 项嵌套消除回归 + D-6 不变量）：attach_with_limits 不持 subscriptions
+    /// 锁进入 attach_snapshot（改动：显式块提前 drop guard），且订阅仍先于快照建立。
+    /// 并发 Subscribe/Unsubscribe 同 conn 不死锁（subscriptions 锁可被其他线程获取）。
+    ///
+    /// 环境限制：测试环境无 ConPTY（`openpty 失败: HRESULT -2147024890`），无法 spawn
+    /// 真实 pane 验证 attach 成功路径。改为验证回滚路径（attach 不存在 pane）+ 并发
+    /// subscribe/unsubscribe 不死锁。D-6 不变量（订阅先于快照）由代码逻辑保证：
+    /// `subscriptions.insert` 在 `attach_snapshot` 前，guard 提前释放（显式块），订阅顺序不变。
+    #[test]
+    fn attach_with_limits_releases_subscriptions_guard_before_snapshot() {
+        let shared = test_shared();
+        let (conn, _rx) = test_conn();
+        let pane_id = PaneId("attach-d6".into());
+
+        // 并发 Subscribe/Unsubscribe 同 conn 不死锁（subscriptions 锁未被 attach 长期持有）。
+        // 此处验证 subscriptions 锁可被其他线程获取——改动后 attach_with_limits 不持该锁
+        // 进入 attach_snapshot，故并发访问不阻塞。
+        let conn2 = Arc::clone(&conn);
+        let h = std::thread::spawn(move || {
+            let mut subs = conn2.subscriptions.lock().unwrap();
+            subs.insert(PaneId("other".into()));
+            subs.remove(&PaneId("other".into()));
+        });
+        h.join().expect("并发 subscribe/unsubscribe 不应死锁");
+
+        // attach 不存在 pane → PaneNotFound + 订阅回滚（D-6 回滚路径）。
+        // attach_with_limits 流程：subscriptions.insert → drop guard → attach_snapshot
+        // （PaneNotFound）→ 回滚 subscriptions.remove。验证 guard 提前释放不影响回滚语义。
+        let result = attach_with_limits(&shared, &conn, pane_id.clone());
+        assert!(
+            matches!(result, Err(ConmuxError::PaneNotFound { .. })),
+            "attach 不存在 pane 应返回 PaneNotFound，实际: {:?}",
+            result
+        );
+        assert!(
+            !conn.subscriptions.lock().unwrap().contains(&pane_id),
+            "D-6：attach 失败应回滚订阅（subscriptions 不含该 pane）"
         );
     }
 

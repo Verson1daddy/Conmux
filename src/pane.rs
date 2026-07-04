@@ -166,31 +166,70 @@ pub(crate) struct Pane {
 }
 
 impl Pane {
-    fn to_state(&self, pane_id: &PaneId) -> PaneState {
-        let (first, last) = {
-            let sb = self.scrollback.lock().unwrap_or_else(recover);
-            sb.line_range_available()
-        };
-        PaneState {
-            pane_id: pane_id.clone(),
-            adapter_id: self.adapter_id.clone(),
-            display_name: self.display_name.clone(),
-            lifecycle: self.lifecycle.clone(),
-            pid: self.pid,
-            exit_code: self.exit_code,
-            working_dir: self.working_dir.clone(),
-            size: self.size,
-            scrollback: ScrollbackInfo {
-                total_bytes: self
-                    .scrollback
-                    .lock()
-                    .unwrap_or_else(recover)
-                    .total_bytes(),
-                first_abs_line: first,
-                last_abs_line: last,
+    /// 表锁内调：拷贝标量元字段 + 取 scrollback 句柄（**不读 scrollback 内容**，
+    /// 不取 scrollback 锁）。配合 [`build_pane_state`] 在表锁外组装 `PaneState`，
+    /// 消除"表锁内取 scrollback 锁"的长持锁风险（C-2 锁纪律）。
+    fn snapshot_meta(&self) -> (Arc<Mutex<LineIndexedBuffer>>, PaneStateMeta) {
+        (
+            Arc::clone(&self.scrollback),
+            PaneStateMeta {
+                adapter_id: self.adapter_id.clone(),
+                display_name: self.display_name.clone(),
+                lifecycle: self.lifecycle.clone(),
+                pid: self.pid,
+                exit_code: self.exit_code,
+                working_dir: self.working_dir.clone(),
+                size: self.size,
+                created_at: self.created_at,
             },
-            created_at: self.created_at,
-        }
+        )
+    }
+}
+
+/// 表锁内拷贝的 pane 标量元字段（不含 scrollback——scrollback 句柄单独取，锁外读）。
+struct PaneStateMeta {
+    adapter_id: String,
+    display_name: Option<String>,
+    lifecycle: PaneLifecycle,
+    pid: Option<u32>,
+    exit_code: Option<i32>,
+    working_dir: String,
+    size: PaneSize,
+    created_at: i64,
+}
+
+/// 表锁外调：读 scrollback 字段（**一次 lock 取齐** total_bytes + 行窗，消除旧 `to_state`
+/// 的 2 次独立 lock）+ 组装 `PaneState`。
+///
+/// 一致性说明：`meta` 是表锁释放前的快照，`scrollback` 字段是锁外读——两者非原子，
+/// scrollback 可能比 meta 稍新（读线程在表锁释放后追加）。这对现有消费方无影响：
+/// `run_exit_sweep` 用 `pane_id` 列表驱动 poll_exit，不依赖跨 pane scrollback 原子性；
+/// `list_panes` 的消费方（对账/展示）容忍单 pane 内的弱一致。
+fn build_pane_state(
+    pane_id: PaneId,
+    scrollback: Arc<Mutex<LineIndexedBuffer>>,
+    meta: PaneStateMeta,
+) -> PaneState {
+    let (total_bytes, first, last) = {
+        let sb = scrollback.lock().unwrap_or_else(recover);
+        let (first, last) = sb.line_range_available();
+        (sb.total_bytes(), first, last)
+    };
+    PaneState {
+        pane_id,
+        adapter_id: meta.adapter_id,
+        display_name: meta.display_name,
+        lifecycle: meta.lifecycle,
+        pid: meta.pid,
+        exit_code: meta.exit_code,
+        working_dir: meta.working_dir,
+        size: meta.size,
+        scrollback: ScrollbackInfo {
+            total_bytes,
+            first_abs_line: first,
+            last_abs_line: last,
+        },
+        created_at: meta.created_at,
     }
 }
 
@@ -206,6 +245,8 @@ pub(crate) struct PaneHostConfig {
     pub(crate) hooks: Vec<Arc<dyn InjectionHook>>,
     /// 事件出口（None = 不起读线程，2a mock 测试用；Windows 路径必给）。
     pub(crate) event_sink: Option<Arc<dyn PaneEventSink>>,
+    /// 信任策略（Slice 2：None = 跳过信任校验，向后兼容；Some = spawn 入口校验）。
+    pub(crate) trust: Option<Arc<dyn crate::trust::TrustPolicy>>,
 }
 
 /// 对外门面。私有持有 pane 表；唯一写入口 `inject_stdin`（MF-1）。
@@ -221,7 +262,42 @@ pub struct PaneHost {
     supervisor_factory: Box<dyn SupervisorFactory>,
     hooks: Vec<Arc<dyn InjectionHook>>,
     event_sink: Option<Arc<dyn PaneEventSink>>,
+    /// 信任策略（Slice 2：None = 跳过，向后兼容；Some = spawn 入口校验）。
+    trust: Option<Arc<dyn crate::trust::TrustPolicy>>,
     panes: Mutex<HashMap<PaneId, Pane>>,
+}
+
+/// 识别 `cmd.exe /c <abs_path>` 包裹形态，返回真正要执行的 shim 绝对路径（Slice 3）。
+///
+/// conmux-app `create_session` 把 shim（.cmd/.bat/无后缀）包成
+/// `program=cmd.exe + args=["/c", shim_abs, ...]`。本函数提取 args[1] 供 `PaneHost::spawn`
+/// 追加验签——否则只验 cmd.exe（A 档永远过），shim 从不被验签。
+///
+/// 命中条件（全满足才返 Some）：
+/// - `program` 文件名 == `cmd.exe`（大小写不敏感）——比较文件名而非全路径，避免硬编 System32。
+/// - `args.len() >= 2` 且 `args[0]` == `/c`（大小写不敏感）。
+/// - `args[1]` 是绝对路径（相对路径/命令串如 `dir` 不触发——无文件可验，维持现状）。
+///
+/// **不命中 = 不收窄**：其它形态（`cmd /k`、`powershell -c`、`cmd /c dir`）维持现状
+/// （仅 program 验过即放行），不引入新拒绝。
+fn cmd_wrap_target(cmd: &CommandSpec) -> Option<String> {
+    let is_cmd_exe = std::path::Path::new(&cmd.program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case("cmd.exe"))
+        .unwrap_or(false);
+    if !is_cmd_exe {
+        return None;
+    }
+    let args = &cmd.args;
+    if args.len() < 2 || !args[0].eq_ignore_ascii_case("/c") {
+        return None;
+    }
+    if std::path::Path::new(&args[1]).is_absolute() {
+        Some(args[1].clone())
+    } else {
+        None
+    }
 }
 
 impl PaneHost {
@@ -232,6 +308,7 @@ impl PaneHost {
             supervisor_factory: config.supervisor_factory,
             hooks: config.hooks,
             event_sink: config.event_sink,
+            trust: config.trust,
             panes: Mutex::new(HashMap::new()),
         }
     }
@@ -249,12 +326,80 @@ impl PaneHost {
             supervisor_factory: Box::new(crate::job::JobObjectSupervisorFactory),
             hooks,
             event_sink: Some(event_sink),
+            trust: None, // 向后兼容：不校验信任（两条上层按需用 new_windows_with_trust）。
+        })
+    }
+
+    /// 公开 Windows 构造器 + 信任策略注入（Slice 2）。
+    /// 信任策略（TrustStore）启动时加载一次，经此注入；spawn 热路径不做文件 I/O。
+    /// 两条上层（conmux-app / conflux-app）应优先用此构造器。
+    #[cfg(windows)]
+    pub fn new_windows_with_trust(
+        hooks: Vec<Arc<dyn InjectionHook>>,
+        event_sink: Arc<dyn PaneEventSink>,
+        trust: Arc<dyn crate::trust::TrustPolicy>,
+    ) -> Self {
+        Self::new(PaneHostConfig {
+            backend: Box::new(crate::pane_win::WindowsPaneBackend),
+            supervisor_factory: Box::new(crate::job::JobObjectSupervisorFactory),
+            hooks,
+            event_sink: Some(event_sink),
+            trust: Some(trust),
         })
     }
 
     /// spawn 一个 pane：backend.open → session.spawn → 监管器 assign（fail-closed，MF-4）
     /// → 注册。assign 失败 ⇒ 不注册（不产生无监管 pane）。读线程/capture 接线在 2b。
     pub fn spawn(&self, req: SpawnRequest) -> Result<PaneId, ConmuxError> {
+        // Slice 1 守卫：到达内核的 program 必为绝对路径（消除"裸名 PATH 解析歧义"——
+        // 注意**不**消除 verify↔spawn 之间文件被替换的 TOCTOU 窗口，见 trust.rs 已知限制 #3）。
+        // 两条上层（conmux-app / conflux-app）负责把裸名解析成绝对路径；裸名透传 = 上游漏
+        // 解析，fail-closed 拒绝（不丢给 CreateProcess 再猜）。Windows `Path::is_absolute()`
+        // 对 `C:\...` / `\\server\share` 返回 true，对 `cmd`/`powershell.exe` 返回 false。
+        if !std::path::Path::new(&req.command.program).is_absolute() {
+            return Err(ConmuxError::NonAbsoluteProgram {
+                program: req.command.program.clone(),
+            });
+        }
+
+        // Slice 2 信任校验：对已解析的绝对路径 program 做三档决策（A 签名 / B 哈希钉 / C 拒）。
+        // trust=None → 跳过（向后兼容）；trust=Some → 校验。TrustPolicy 内部处理 mode
+        // （enforce/warn/off），warn/off 始终返 Allow，enforce 返真实决策。
+        //
+        // Slice 3 cmd-wrap 加固：conmux-app 把 shim（.cmd/.bat/无后缀）包成
+        // `program=cmd.exe + args=["/c", shim_abs, ...]`。若只验 program=cmd.exe（A 档永远过），
+        // args 里的 shim 从不被验签 → B 档哈希钉形同虚设。故在 program 验过后，识别
+        // `cmd.exe /c <abs_path>` 形态、追加验签 <abs_path>（真正执行的 shim）。
+        // 防绕过：program 先验（挡 C:\evil\cmd.exe 冒名）。conmux-app 自动包裹的 shim 恒为
+        // 绝对路径（create_session 先 resolve_on_path 再包）→ 必命中、必验签，主威胁已堵。
+        // 已知残留：args[1] 相对路径不验——`cmd /c dir` 是内建无文件可验；但 `cmd /c x.cmd`
+        // 相对名 cmd 仍会按 PATH/cwd 解析并跑、却不被验签。仅当用户**手写**相对 cmd-wrap 命令
+        // 时触发（自残式，非 方案 A 主威胁；自动包裹路径不受影响）。收窄需规范化相对 args 再验。
+        if let Some(trust) = &self.trust {
+            let path = std::path::Path::new(&req.command.program);
+            match trust.verify(path) {
+                crate::trust::TrustDecision::Allow => {}
+                crate::trust::TrustDecision::Reject { reason } => {
+                    return Err(ConmuxError::UntrustedProgram {
+                        program: req.command.program.clone(),
+                        reason,
+                    });
+                }
+            }
+            // cmd-wrap 追加验签：program 已过（真 cmd.exe）+ args[0]="/c" + args[1] 绝对路径 → 验 shim。
+            if let Some(shim_path) = cmd_wrap_target(&req.command) {
+                match trust.verify(std::path::Path::new(&shim_path)) {
+                    crate::trust::TrustDecision::Allow => {}
+                    crate::trust::TrustDecision::Reject { reason } => {
+                        return Err(ConmuxError::UntrustedProgram {
+                            program: shim_path,
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
+
         {
             let panes = self.panes.lock().unwrap_or_else(recover);
             if panes.contains_key(&req.pane_id) {
@@ -626,20 +771,39 @@ impl PaneHost {
 
     /// 对账/死亡检测用。
     pub fn list_panes(&self) -> Vec<PaneState> {
-        let panes = self.panes.lock().unwrap_or_else(recover);
-        panes.iter().map(|(id, pane)| pane.to_state(id)).collect()
+        // C-2 锁纪律：表锁内只拷贝标量字段 + Arc::clone(&scrollback)，立即释放；
+        // scrollback 字段在锁外逐 pane 读（消除表锁内 N 次取 scrollback 锁的长持锁）。
+        let snapshots: Vec<(PaneId, Arc<Mutex<LineIndexedBuffer>>, PaneStateMeta)> = {
+            let panes = self.panes.lock().unwrap_or_else(recover);
+            panes
+                .iter()
+                .map(|(id, pane)| {
+                    let (sb, meta) = pane.snapshot_meta();
+                    (id.clone(), sb, meta)
+                })
+                .collect()
+        };
+        snapshots
+            .into_iter()
+            .map(|(id, sb, meta)| build_pane_state(id, sb, meta))
+            .collect()
     }
 
     /// 单 pane 状态查询（V1-core：行级 jump-back 的 scrollback 高水位取数路径——
     /// ingest 每事件一查，避免 list_panes O(n)）。
     pub fn pane_state(&self, pane_id: &PaneId) -> Result<PaneState, ConmuxError> {
-        let panes = self.panes.lock().unwrap_or_else(recover);
-        panes
-            .get(pane_id)
-            .map(|pane| pane.to_state(pane_id))
-            .ok_or_else(|| ConmuxError::PaneNotFound {
-                pane_id: pane_id.0.clone(),
-            })
+        // C-2 锁纪律：同 list_panes——表锁内只取句柄 + 拷贝标量，锁外读 scrollback。
+        let (pane_id, scrollback, meta) = {
+            let panes = self.panes.lock().unwrap_or_else(recover);
+            let pane = panes
+                .get(pane_id)
+                .ok_or_else(|| ConmuxError::PaneNotFound {
+                    pane_id: pane_id.0.clone(),
+                })?;
+            let (sb, meta) = pane.snapshot_meta();
+            (pane_id.clone(), sb, meta)
+        };
+        Ok(build_pane_state(pane_id, scrollback, meta))
     }
 
     /// 捕获 pane scrollback（契约 §3.4 / §6）。ANSI 开关：`ansi=false` 剥离 VT 序列
@@ -652,45 +816,60 @@ impl PaneHost {
         req: crate::capture::CaptureRequest,
     ) -> Result<crate::capture::CaptureResult, ConmuxError> {
         use crate::capture::CaptureRange;
-        let panes = self.panes.lock().unwrap_or_else(recover);
-        let pane = panes
-            .get(&req.pane_id)
-            .ok_or_else(|| ConmuxError::PaneNotFound {
-                pane_id: req.pane_id.0.clone(),
-            })?;
-        let sb = pane.scrollback.lock().unwrap_or_else(recover);
-        let (first, last) = sb.line_range_available();
+        // C-2 锁纪律：表锁内只取 scrollback 句柄，立即释放（对齐 attach_snapshot）。
+        //
+        // 代际守卫说明：capture **不写回 pane 字段**，与 resize/poll_exit 不同（它们
+        // 要写回 size/lifecycle，故需 `Arc::ptr_eq` 验证代际防旧代际污染新 pane）。
+        // 这里 Arc 引用计数保证：取句柄后即使 pane 被 kill+respawn（同 id 新 pane），
+        // 旧 `Arc<scrollback>` 仍存活，读到的是取句柄那一刻的 scrollback，不会读到
+        // 新 pane 的数据，也不会 panic。代际一致性天然成立，无需 ptr_eq 写回守卫
+        // （回归测试 `capture_after_respawn_reads_old_generation_scrollback`）。
+        let scrollback = {
+            let panes = self.panes.lock().unwrap_or_else(recover);
+            let pane = panes
+                .get(&req.pane_id)
+                .ok_or_else(|| ConmuxError::PaneNotFound {
+                    pane_id: req.pane_id.0.clone(),
+                })?;
+            Arc::clone(&pane.scrollback)
+        };
+        // 锁外读 scrollback + base64 编码（H-1：重活移出表锁，避免冻结全表）。
+        let (data_base64, first, last, truncated, effectively_full) = {
+            let sb = scrollback.lock().unwrap_or_else(recover);
+            let (first, last) = sb.line_range_available();
 
-        // 取字节 + truncated 判定（LineRange 被环覆盖 → None → truncated）。
-        let (raw, truncated) = match &req.range {
-            CaptureRange::All => (sb.read_all_bytes(), false),
-            CaptureRange::LastBytes(n) => {
-                let valid = sb.total_bytes() as usize;
-                (sb.read_last_bytes(*n), *n > valid)
-            }
-            CaptureRange::LineRange { start_abs, end_abs } => {
-                // read_lines 是 [start, end)；契约 end_abs 含端 → +1。
-                match sb.read_lines(*start_abs, end_abs.saturating_add(1)) {
-                    Some(bytes) => (bytes, false),
-                    None => (Vec::new(), true), // 起始已被环覆盖，不静默返部分
+            // 取字节 + truncated 判定（LineRange 被环覆盖 → None → truncated）。
+            let (raw, truncated) = match &req.range {
+                CaptureRange::All => (sb.read_all_bytes(), false),
+                CaptureRange::LastBytes(n) => {
+                    let valid = sb.total_bytes() as usize;
+                    (sb.read_last_bytes(*n), *n > valid)
                 }
-            }
-        };
+                CaptureRange::LineRange { start_abs, end_abs } => {
+                    // read_lines 是 [start, end)；契约 end_abs 含端 → +1。
+                    match sb.read_lines(*start_abs, end_abs.saturating_add(1)) {
+                        Some(bytes) => (bytes, false),
+                        None => (Vec::new(), true), // 起始已被环覆盖，不静默返部分
+                    }
+                }
+            };
 
-        let data = if req.ansi {
-            raw
-        } else {
-            crate::capture::strip_ansi(&raw)
-        };
-        let data_base64 = base64_encode(&data);
+            let data = if req.ansi {
+                raw
+            } else {
+                crate::capture::strip_ansi(&raw)
+            };
+            let data_base64 = base64_encode(&data);
 
-        // 等效全量判定（复闸 C2）：按有效覆盖而非枚举变体，杜绝换 range 规避审计。
-        let effectively_full = crate::capture::is_effectively_full(
-            &req.range,
-            sb.total_bytes() as usize,
-            first,
-            last,
-        );
+            // 等效全量判定（复闸 C2）：按有效覆盖而非枚举变体，杜绝换 range 规避审计。
+            let effectively_full = crate::capture::is_effectively_full(
+                &req.range,
+                sb.total_bytes() as usize,
+                first,
+                last,
+            );
+            (data_base64, first, last, truncated, effectively_full)
+        };
 
         Ok(crate::capture::CaptureResult {
             data_base64,
@@ -908,6 +1087,7 @@ mod tests {
             }),
             hooks: vec![Arc::new(hook)],
             event_sink: None, // mock 路径不起读线程
+            trust: None,     // mock 测试不校验信任
         });
         Fixture {
             host,
@@ -918,10 +1098,16 @@ mod tests {
     }
 
     fn req(id: &str) -> SpawnRequest {
+        // Slice 1：内核 spawn 守卫要求 program 为绝对路径。MockSession.spawn 不检查 program
+        // （用 `_cmd`），故用编译期绝对路径（CARGO_MANIFEST_DIR）满足守卫即可，文件无需存在。
+        let abs_program = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-fake-cmd.exe")
+            .to_string_lossy()
+            .into_owned();
         SpawnRequest {
             pane_id: PaneId(id.into()),
             command: CommandSpec {
-                program: "cmd.exe".into(),
+                program: abs_program,
                 args: vec![],
                 cwd: Some("D:\\repo".into()),
                 env: vec![],
@@ -931,6 +1117,18 @@ mod tests {
             display_name: Some("rev".into()),
             created_at: 1_700_000_000,
         }
+    }
+
+    #[test]
+    fn spawn_rejects_non_absolute_program() {
+        // Slice 1 守卫：裸名 program → fail-closed NonAbsoluteProgram（不丢给 CreateProcess 猜）。
+        let f = fixture_with_pid(1);
+        let mut r = req("p1");
+        r.command.program = "cmd.exe".to_string(); // 裸名
+        assert!(matches!(
+            f.host.spawn(r),
+            Err(ConmuxError::NonAbsoluteProgram { .. })
+        ));
     }
 
     #[test]
@@ -956,6 +1154,192 @@ mod tests {
             f.host.spawn(req("dup")),
             Err(ConmuxError::SpawnFailed { .. })
         ));
+    }
+
+    // ===== Slice 3：cmd-wrap 验签加固 =====
+    //
+    // conmux-app 把 shim（.cmd/.bat/无后缀）包成 `cmd.exe /c <shim_abs>`。原验签只校验
+    // program=cmd.exe（A 档永远过），shim 在 args 里从不被验签。以下测试确认 spawn 现在
+    // 把 shim 路径（而非 cmd.exe）送去二次验签，且 fail-closed 拒绝未 pin 的 shim。
+
+    /// 记录被 verify 的路径，可配置拒绝集（测试 cmd-wrap 把 shim 而非 cmd.exe 送去验签）。
+    struct RecordingTrust {
+        seen: Arc<StdMutex<Vec<String>>>,
+        reject: Vec<String>,
+    }
+    impl crate::trust::TrustPolicy for RecordingTrust {
+        fn verify(&self, program: &std::path::Path) -> crate::trust::TrustDecision {
+            let p = program.to_string_lossy().to_string();
+            self.seen.lock().unwrap().push(p.clone());
+            if self.reject.iter().any(|r| r.eq_ignore_ascii_case(&p)) {
+                crate::trust::TrustDecision::Reject {
+                    reason: format!("mock reject: {p}"),
+                }
+            } else {
+                crate::trust::TrustDecision::Allow
+            }
+        }
+    }
+
+    fn abs_path(name: &str) -> String {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// 构造 `cmd.exe /c <shim_abs>` 形态的 SpawnRequest（模拟 conmux-app create_session 包 shim）。
+    fn cmd_wrap_req(id: &str, shim_abs: &str) -> SpawnRequest {
+        SpawnRequest {
+            pane_id: PaneId(id.into()),
+            command: CommandSpec {
+                program: abs_path("cmd.exe"),
+                args: vec!["/c".into(), shim_abs.into()],
+                cwd: Some("D:\\repo".into()),
+                env: vec![],
+            },
+            size: PaneSize { rows: 24, cols: 80 },
+            adapter_id: "claude-code".into(),
+            display_name: Some("rev".into()),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    fn host_with_trust(trust: Arc<dyn crate::trust::TrustPolicy>) -> PaneHost {
+        PaneHost::new(PaneHostConfig {
+            backend: Box::new(MockBackend {
+                state: Arc::new(StdMutex::new(MockSessionState::default())),
+                pid: 1,
+            }),
+            supervisor_factory: Box::new(MockSupervisorFactory {
+                rec: Arc::new(StdMutex::new(SupervisorRecord::default())),
+            }),
+            hooks: vec![],
+            event_sink: None,
+            trust: Some(trust),
+        })
+    }
+
+    #[test]
+    fn cmd_wrap_target_extracts_shim_path() {
+        // 命中：cmd.exe /c <abs> → Some(abs)
+        let cmd = CommandSpec {
+            program: abs_path("cmd.exe"),
+            args: vec!["/c".into(), abs_path("shim.cmd")],
+            cwd: None,
+            env: vec![],
+        };
+        assert_eq!(cmd_wrap_target(&cmd), Some(abs_path("shim.cmd")));
+
+        // 大小写不敏感（CMD.EXE /C）
+        let cmd = CommandSpec {
+            program: abs_path("CMD.EXE"),
+            args: vec!["/C".into(), abs_path("shim.cmd")],
+            cwd: None,
+            env: vec![],
+        };
+        assert_eq!(cmd_wrap_target(&cmd), Some(abs_path("shim.cmd")));
+
+        // 非 cmd.exe（powershell）→ None
+        let cmd = CommandSpec {
+            program: abs_path("powershell.exe"),
+            args: vec!["/c".into(), abs_path("shim.cmd")],
+            cwd: None,
+            env: vec![],
+        };
+        assert_eq!(cmd_wrap_target(&cmd), None);
+
+        // /k 而非 /c → None
+        let cmd = CommandSpec {
+            program: abs_path("cmd.exe"),
+            args: vec!["/k".into(), abs_path("shim.cmd")],
+            cwd: None,
+            env: vec![],
+        };
+        assert_eq!(cmd_wrap_target(&cmd), None);
+
+        // 相对路径 args[1]（如 `cmd /c dir`）→ None（无文件可验，维持现状）
+        let cmd = CommandSpec {
+            program: abs_path("cmd.exe"),
+            args: vec!["/c".into(), "dir".into()],
+            cwd: None,
+            env: vec![],
+        };
+        assert_eq!(cmd_wrap_target(&cmd), None);
+
+        // args 不足 → None
+        let cmd = CommandSpec {
+            program: abs_path("cmd.exe"),
+            args: vec!["/c".into()],
+            cwd: None,
+            env: vec![],
+        };
+        assert_eq!(cmd_wrap_target(&cmd), None);
+    }
+
+    #[test]
+    fn spawn_cmd_wrap_verifies_shim_not_just_cmd() {
+        // 关键断言：cmd-wrap 形态下，shim 路径被送去验签（不只是 cmd.exe）。
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let trust: Arc<dyn crate::trust::TrustPolicy> = Arc::new(RecordingTrust {
+            seen: Arc::clone(&seen),
+            reject: vec![],
+        });
+        let host = host_with_trust(trust);
+        let shim = abs_path("test-fake-shim.cmd");
+        host.spawn(cmd_wrap_req("p1", &shim)).unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|p| p.eq_ignore_ascii_case(&shim)),
+            "shim 路径应被验签，实际 verify 调用: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|p| p.eq_ignore_ascii_case(&abs_path("cmd.exe"))),
+            "cmd.exe 也应被验签（先验 program）: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_cmd_wrap_rejects_unpinned_shim_fail_closed() {
+        // shim 未 pin → fail-closed 拒绝，错误指向 shim 路径（驱动 pin UI）。
+        let shim = abs_path("test-fake-shim.cmd");
+        let trust: Arc<dyn crate::trust::TrustPolicy> = Arc::new(RecordingTrust {
+            seen: Arc::new(StdMutex::new(Vec::new())),
+            reject: vec![shim.clone()],
+        });
+        let host = host_with_trust(trust);
+        let err = host.spawn(cmd_wrap_req("p1", &shim)).unwrap_err();
+        match err {
+            ConmuxError::UntrustedProgram { program, reason } => {
+                assert!(
+                    program.eq_ignore_ascii_case(&shim),
+                    "错误应指向 shim 路径，实际: {program}"
+                );
+                assert!(reason.contains("mock reject"), "reason: {reason}");
+            }
+            other => panic!("期望 UntrustedProgram，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_cmd_wrap_relative_arg_not_verified() {
+        // `cmd /c dir`（相对 args[1]）→ shim 不触发二次验签，spawn 放行（不破默认 cmd 用法）。
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let trust: Arc<dyn crate::trust::TrustPolicy> = Arc::new(RecordingTrust {
+            seen: Arc::clone(&seen),
+            reject: vec!["dir".into()],
+        });
+        let host = host_with_trust(trust);
+        let mut r = cmd_wrap_req("p1", "ignored");
+        r.command.args = vec!["/c".into(), "dir".into()];
+        host.spawn(r).unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|p| p == "dir"),
+            "相对路径 args[1] 不应被验签: {seen:?}"
+        );
     }
 
     // ===== C-2 锁纪律：表锁=短临界区，阻塞操作一律句柄取出后锁外执行 =====
@@ -1416,6 +1800,7 @@ mod tests {
                 reentered: Arc::clone(&reentered),
             })],
             event_sink: None,
+            trust: None, // mock 测试不校验信任
         }));
         *host_slot.lock().unwrap() = Some(Arc::clone(&host));
         host.spawn(req("p1")).unwrap();
@@ -1483,6 +1868,136 @@ mod tests {
         ));
     }
 
+    // ===== C-2 锁纪律扩展测试（方案 A：锁内重活移出锁外）=====
+
+    /// 辅助：从 host 表里取指定 pane 的 scrollback Arc（测试用，同模块可访问私有字段）。
+    fn scrollback_arc(host: &PaneHost, id: &PaneId) -> Arc<Mutex<LineIndexedBuffer>> {
+        let panes = host.panes.lock().unwrap();
+        Arc::clone(&panes.get(id).unwrap().scrollback)
+    }
+
+    /// 测试 1（红绿驱动）：capture 期间表锁不被持有——即使 scrollback 读被阻塞，
+    /// 并发 spawn 仍应立即完成（修复前 capture 在表锁内取 scrollback 锁，会冻结全表）。
+    #[test]
+    fn capture_does_not_freeze_host_during_slow_scrollback_read() {
+        let f = fixture_with_pid(1);
+        let host = Arc::new(f.host);
+        host.spawn(req("a")).unwrap();
+
+        let sb = scrollback_arc(&host, &PaneId("a".into()));
+        sb.lock().unwrap().append_and_seq(b"hello\n");
+
+        // T0：持有 scrollback 锁，让 capture 卡在锁外读 scrollback 阶段。
+        let sb_guard = sb.lock().unwrap();
+
+        // T1：capture "a"——取句柄（表锁短持）后，卡在 scrollback.lock()。
+        let h1 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || {
+                host.capture(crate::capture::CaptureRequest {
+                    pane_id: PaneId("a".into()),
+                    range: crate::capture::CaptureRange::All,
+                    ansi: true,
+                })
+            })
+        };
+        // 等 T1 进入 capture 并卡在 scrollback lock。
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // T2：spawn "b"——修复后表锁未被 capture 持有，应立即完成。
+        let h2 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || host.spawn(req("b")))
+        };
+        let result = h2.join().expect("T2 panic");
+        assert!(result.is_ok(), "spawn 'b' 不应被 capture 阻塞");
+
+        // 清理：释放 scrollback 锁，让 T1 完成。
+        drop(sb_guard);
+        let _ = h1.join().expect("T1 panic");
+    }
+
+    /// 测试 2（红绿驱动）：list_panes 期间表锁不被持有——即使 scrollback 读被阻塞，
+    /// 并发 spawn 仍应立即完成（修复前 list_panes 在表锁内逐 pane 取 scrollback 锁）。
+    #[test]
+    fn list_panes_does_not_freeze_host_during_slow_scrollback_read() {
+        let f = fixture_with_pid(1);
+        let host = Arc::new(f.host);
+        host.spawn(req("a")).unwrap();
+
+        let sb = scrollback_arc(&host, &PaneId("a".into()));
+        sb.lock().unwrap().append_and_seq(b"data\n");
+
+        // T0：持有 scrollback 锁，让 list_panes 卡在锁外读 scrollback 阶段。
+        let sb_guard = sb.lock().unwrap();
+
+        // T1：list_panes——表锁短持（拷贝标量 + 取句柄）后，卡在 build_pane_state 的 scrollback lock。
+        let h1 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || host.list_panes())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // T2：spawn "b"——修复后表锁未被 list_panes 持有，应立即完成。
+        let h2 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || host.spawn(req("b")))
+        };
+        let result = h2.join().expect("T2 panic");
+        assert!(result.is_ok(), "spawn 'b' 不应被 list_panes 阻塞");
+
+        drop(sb_guard);
+        let _ = h1.join().expect("T1 panic");
+    }
+
+    /// 测试 3（代际一致）：capture 取句柄后、读 scrollback 前，pane 被 kill+respawn
+    /// （同 id 新 pane）。Arc 引用计数保证读到旧 pane 的 scrollback，不读新 pane、不 panic。
+    #[test]
+    fn capture_after_respawn_reads_old_generation_scrollback() {
+        use base64::Engine;
+        let f = fixture_with_pid(1);
+        let host = Arc::new(f.host);
+        host.spawn(req("a")).unwrap();
+
+        // 旧 pane 写 "old data"。
+        let old_sb = scrollback_arc(&host, &PaneId("a".into()));
+        old_sb.lock().unwrap().append_and_seq(b"old data\n");
+
+        // T0：持有旧 scrollback 锁，让 capture 卡在锁外读阶段。
+        let sb_guard = old_sb.lock().unwrap();
+
+        // T1：capture "a"——取到旧 pane 的 scrollback Arc，卡在 scrollback.lock()。
+        let h1 = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || {
+                host.capture(crate::capture::CaptureRequest {
+                    pane_id: PaneId("a".into()),
+                    range: crate::capture::CaptureRange::All,
+                    ansi: true,
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // kill "a"（remove 旧 pane）+ respawn "a"（新 pane，新 scrollback Arc）。
+        host.kill(&PaneId("a".into())).unwrap();
+        host.spawn(req("a")).unwrap();
+
+        // 新 pane 写 "new data"。
+        let new_sb = scrollback_arc(&host, &PaneId("a".into()));
+        new_sb.lock().unwrap().append_and_seq(b"new data\n");
+
+        // 释放旧 scrollback 锁——T1 的 capture 继续读旧 scrollback（Arc 存活）。
+        drop(sb_guard);
+        let result = h1.join().expect("T1 panic").expect("capture err");
+
+        // 验证读到的是旧 pane 的 "old data"，不是新 pane 的 "new data"。
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result.data_base64)
+            .unwrap();
+        assert_eq!(decoded, b"old data\n", "应读到旧代际 scrollback（Arc 存活保证）");
+    }
+
     // ===== Windows 端到端集成（cutover 2b-3）：new_windows 真实组装 =====
     #[cfg(windows)]
     mod windows_e2e {
@@ -1500,11 +2015,30 @@ mod tests {
             }
         }
 
+        // Slice 1：内核 spawn 守卫要求绝对路径。ConPTY 集成测试用 SystemRoot 拼系统 exe
+        // 绝对路径（Windows 标准路径，真机稳定）。
+        fn system_cmd() -> String {
+            std::path::PathBuf::from(
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+            )
+            .join("System32\\cmd.exe")
+            .to_string_lossy()
+            .into_owned()
+        }
+        fn system_powershell() -> String {
+            std::path::PathBuf::from(
+                std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()),
+            )
+            .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+            .to_string_lossy()
+            .into_owned()
+        }
+
         fn win_req(id: &str, echo: &str) -> SpawnRequest {
             SpawnRequest {
                 pane_id: PaneId(id.into()),
                 command: CommandSpec {
-                    program: "cmd.exe".into(),
+                    program: system_cmd(),
                     args: vec!["/c".into(), format!("echo {echo}")],
                     cwd: None,
                     env: vec![],
@@ -1585,7 +2119,7 @@ mod tests {
             host.spawn(SpawnRequest {
                 pane_id: PaneId("w2".into()),
                 command: CommandSpec {
-                    program: "cmd.exe".into(),
+                    program: system_cmd(),
                     args: vec![],
                     cwd: None,
                     env: vec![],
@@ -1637,7 +2171,7 @@ mod tests {
             let req = SpawnRequest {
                 pane_id: PaneId("wm".into()),
                 command: CommandSpec {
-                    program: "powershell.exe".into(),
+                    program: system_powershell(),
                     args: vec![
                         "-NoProfile".into(),
                         "-Command".into(),
@@ -1784,7 +2318,7 @@ mod tests {
             host.spawn(SpawnRequest {
                 pane_id: PaneId("w4".into()),
                 command: CommandSpec {
-                    program: "cmd.exe".into(),
+                    program: system_cmd(),
                     args: vec!["/c".into(), "exit 5".into()],
                     cwd: None,
                     env: vec![],
