@@ -1,0 +1,13 @@
+[book]
+title = "The Conmux Manual"
+authors = ["稻穗"]
+language = "en"
+src = "src"
+description = "Middleware that makes agent CLIs runnable — and watchable — on Windows. A tiered hands-on manual."
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/Verson1daddy/Conmux"
+edit-url-template = "https://github.com/Verson1daddy/Conmux/edit/main/docs/manual/en/{path}"
+additional-js = ["lang-toggle.js"]

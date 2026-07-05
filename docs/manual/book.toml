@@ -10,3 +10,4 @@ default-theme = "rust"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/Verson1daddy/Conmux"
 edit-url-template = "https://github.com/Verson1daddy/Conmux/edit/main/docs/manual/{path}"
+additional-js = ["lang-toggle.js"]
