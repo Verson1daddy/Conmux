@@ -155,3 +155,18 @@ conmux 是**华南师范大学**一名学生做的开源项目——想把 Windo
 ## License
 
 双许可，[MIT](LICENSE-MIT) 或 [Apache 2.0](LICENSE-APACHE)，任选其一。
+
+---
+
+## Star History · 星标历史
+
+<a href="https://www.star-history.com/#Verson1daddy/Conmux&Verson1daddy/Conflux&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Verson1daddy/Conmux,Verson1daddy/Conflux&type=Date&theme=dark">
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Verson1daddy/Conmux,Verson1daddy/Conflux&type=Date" width="620">
+  </picture>
+</a>
+
+> 如果这个项目对您真的有帮助的话！还请 star star，fork fork！感谢各位！🌾
+>
+> If it genuinely helps you — please star star, fork fork! Thank you all! ⭐
